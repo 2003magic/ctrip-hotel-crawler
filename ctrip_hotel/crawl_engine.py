@@ -203,10 +203,15 @@ def _worker_crawl_api(
     cfg: dict[str, Any],
     run_dir: str,
 ) -> dict[str, Any]:
-    """API-mode worker: one headless page per worker, serial in-page fetches.
+    """API-mode worker: warmup once, then fetch rooms via PURE HTTP concurrently.
 
-    Each worker opens its own browser + page (warmup once), then replays room /
-    album / additional requests inside the page for every assigned hotel.
+    A single headless page is used only to obtain a valid phantom-token + cookies
+    (and optionally album/additional templates). After warmup, room status for all
+    hotels is fetched with curl_cffi in a thread pool — no browser per hotel.
+
+    album / additional are best-effort: if the page captured templates for them,
+    they are replayed in-page serially; otherwise they are omitted (list meta still
+    provides name/star/score/address and a cover image).
     """
     run = Path(run_dir)
     worker_dir = run / "workers" / f"w{worker_id}"
@@ -217,16 +222,19 @@ def _worker_crawl_api(
     docs: list[dict[str, Any]] = []
     ok_ids: list[Any] = []
     err_ids: list[Any] = []
-    delay = int(cfg.get("delay_ms") or 800) / 1000.0
+    delay = int(cfg.get("delay_ms") or 0) / 1000.0
+    max_workers = max(int(cfg.get("api_workers") or 8), 1)
 
-    print(f"[w{worker_id}] API 模式开始，本组 {len(hotels)} 家")
+    print(f"[w{worker_id}] API 模式开始，本组 {len(hotels)} 家 (并发 {max_workers})")
     with ApiRoomClient(cfg, worker_id=worker_id) as client:
-        for i, h in enumerate(hotels, 1):
+        room_payloads = client.fetch_room_batch(
+            [h["hotel_id"] for h in hotels], max_workers=max_workers
+        )
+        for h, room_payload in zip(hotels, room_payloads):
             hid = h["hotel_id"]
             name = h.get("name") or ""
-            print(f"[w{worker_id}] ({i}/{len(hotels)}) {hid} {name}")
             try:
-                room_payload = client.fetch_room(hid)
+                # Best-effort album/additional via in-page replay (optional).
                 album_payload = client.fetch_album(hid)
                 additional_payload = client.fetch_additional(hid)
                 result = build_fetch_result(
@@ -247,8 +255,7 @@ def _worker_crawl_api(
                 )
                 gaps = document_gaps(doc)
                 if gaps and "rooms" in gaps:
-                    print(f"[w{worker_id}]   retry (no rooms) gaps={gaps}")
-                    time.sleep(1.0)
+                    print(f"[w{worker_id}]   retry (no rooms) {hid}")
                     room_payload = client.fetch_room(hid)
                     result = build_fetch_result(
                         hotel_id=hid,
@@ -284,14 +291,13 @@ def _worker_crawl_api(
                 n_himgs = len(hotel.get("images") or [])
                 if n_rooms == 0:
                     err_ids.append(hid)
-                    print(f"[w{worker_id}]   ! no rooms gaps={gaps}")
+                    print(f"[w{worker_id}]   ! {hid} no rooms gaps={gaps}")
                 else:
                     ok_ids.append(hid)
                     print(
-                        f"[w{worker_id}]   ok rooms={n_rooms} hotel_imgs={n_himgs} "
-                        f"addr={'Y' if hotel.get('address') else 'N'} "
+                        f"[w{worker_id}]   ok {hid} rooms={n_rooms} imgs={n_himgs} "
                         f"nearby={sum(len(hotel.get('nearby',{}).get(k) or []) for k in ('metro','airport','train','other'))} "
-                        f"gaps={gaps or 'none'} source={doc.get('source')}"
+                        f"gaps={gaps or 'none'}"
                     )
                     mark_done(
                         cfg["output_dir"],
@@ -311,8 +317,8 @@ def _worker_crawl_api(
                     )
             except Exception as e:
                 err_ids.append(hid)
-                print(f"[w{worker_id}]   !! {e}")
-            if i < len(hotels) and delay > 0:
+                print(f"[w{worker_id}]   !! {hid} {e}")
+            if delay > 0:
                 time.sleep(delay)
 
     write_json(

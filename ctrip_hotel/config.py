@@ -36,6 +36,7 @@ DEFAULTS: dict[str, Any] = {
     "page_size": 20,
     "seed_hotel_id": 1,
     "api_headed": False,  # API 模式浏览器是否显示窗口（首次过人机验证时可设 true）
+    "api_workers": 8,  # API 模式每个 worker 内的并发线程数
     # Optional proxies (e.g. http://ip:port). List fetch can rotate through
     # `proxy_list`; browser warmup uses `proxy`.
     "proxy": None,
@@ -58,9 +59,9 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
     today = date.today()
     check_in = cfg.get("check_in") or (today + timedelta(days=7)).isoformat()
     check_out = cfg.get("check_out") or (
-        date.fromisoformat(check_in) + timedelta(days=1)
+        date.fromisoformat(str(check_in)) + timedelta(days=1)
     ).isoformat()
-    cfg["check_in"] = check_in
-    cfg["check_out"] = check_out
+    cfg["check_in"] = str(check_in)
+    cfg["check_out"] = str(check_out)
     cfg["output_dir"] = str((ROOT / cfg["output_dir"]).resolve())
     return cfg

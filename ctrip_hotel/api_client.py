@@ -206,6 +206,7 @@ class ApiRoomClient:
         self._template: dict[str, Any] | None = None
         self._album_template: dict[str, Any] | None = None
         self._additional_template: dict[str, Any] | None = None
+        self._cookies: str = ""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -277,25 +278,44 @@ class ApiRoomClient:
 
         captured: dict[str, Any] = {}
 
-        def on_request(req) -> None:
-            low = req.url.lower()
-            try:
-                if "getHotelRoomListInland" in low and "room" not in captured:
-                    captured["room"] = {"url": req.url, "post": req.post_data}
-                elif ("gethotelalbumpicture" in low or "ctgethotelalbum" in low) and "album" not in captured:
-                    captured["album"] = {"url": req.url, "post": req.post_data}
-                elif "getdetailadditionalinfo" in low and "additional" not in captured:
-                    captured["additional"] = {"url": req.url, "post": req.post_data}
-            except Exception:
-                pass
-
-        self._page.on("request", on_request)
+        # Capture via a fetch hook injected before page load — more reliable than
+        # the page.on("request") event, and lets us grab the phantom-token header
+        # that the page automatically attaches.
+        self._page.add_init_script(
+            """
+            window.__CTRIP_CAPTURED__ = window.__CTRIP_CAPTURED__ || {};
+            const origFetch = window.fetch;
+            window.fetch = function(...args) {
+                try {
+                    const [url, opts] = args;
+                    const u = String(url);
+                    if (u.includes('getHotelRoomListInland')) {
+                        window.__CTRIP_CAPTURED__.room = {
+                            url: u,
+                            post: opts ? String(opts.body || '') : '',
+                            headers: opts && opts.headers ? JSON.parse(JSON.stringify(opts.headers)) : {}
+                        };
+                    } else if (u.includes('gethotelalbumpicture') || u.includes('ctgethotelalbum')) {
+                        if (!window.__CTRIP_CAPTURED__.album) {
+                            window.__CTRIP_CAPTURED__.album = {url: u, post: opts ? String(opts.body || '') : ''};
+                        }
+                    } else if (u.includes('getdetailadditionalinfo')) {
+                        if (!window.__CTRIP_CAPTURED__.additional) {
+                            window.__CTRIP_CAPTURED__.additional = {url: u, post: opts ? String(opts.body || '') : ''};
+                        }
+                    }
+                } catch(e) {}
+                return origFetch.apply(this, args);
+            };
+            """
+        )
         for i, sid in enumerate(seed_ids):
             url = (
                 f"https://m.ctrip.com/webapp/hotel/hoteldetail/{sid}.html"
                 f"?checkIn={self.cfg['check_in']}&checkOut={self.cfg['check_out']}"
             )
             print(f"  [api] warmup attempt {i + 1}/{len(seed_ids)}: seed={sid}")
+            self._page.evaluate("() => { window.__CTRIP_CAPTURED__ = {}; }")
             try:
                 self._page.goto(url, timeout=60000)
             except Exception as e:
@@ -303,7 +323,13 @@ class ApiRoomClient:
             # Wait for the room API to fire; scroll to trigger album/additional.
             deadline = time.time() + 15
             while time.time() < deadline:
-                if "room" in captured and "album" in captured and "additional" in captured:
+                cap = self._page.evaluate("() => window.__CTRIP_CAPTURED__ || {}")
+                if cap.get("room"):
+                    captured["room"] = cap["room"]
+                    if cap.get("album"):
+                        captured["album"] = cap["album"]
+                    if cap.get("additional"):
+                        captured["additional"] = cap["additional"]
                     break
                 self._page.wait_for_timeout(400)
                 if time.time() < deadline:
@@ -313,7 +339,6 @@ class ApiRoomClient:
                         pass
             if "room" in captured:
                 break
-        self._page.remove_listener("request", on_request)
 
         if "room" not in captured:
             raise RuntimeError(
@@ -329,49 +354,101 @@ class ApiRoomClient:
         self._template = captured["room"]
         self._album_template = captured.get("album")
         self._additional_template = captured.get("additional")
+        # Capture cookies from the browser context for pure-HTTP replays.
+        try:
+            self._cookies = "; ".join(
+                f"{c['name']}={c['value']}" for c in self._page.context.cookies()
+            )
+        except Exception:
+            self._cookies = ""
         print(
             f"  [api] warmup ok: room={'Y' if self._template else 'N'} "
             f"album={'Y' if self._album_template else 'N'} "
             f"additional={'Y' if self._additional_template else 'N'}"
         )
 
-    # -- room fetch ---------------------------------------------------------
+    # -- room fetch (pure HTTP, token reuse) --------------------------------
+
+    def _room_headers(self) -> dict[str, str]:
+        """Build headers for pure-HTTP room requests from the captured template."""
+        hdrs = self._template.get("headers") or {}
+        base = {
+            "User-Agent": hdrs.get("user-agent")
+            or "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Content-Type": "application/json",
+            "Referer": hdrs.get("referer") or "https://m.ctrip.com/webapp/hotel/hoteldetail",
+            "Origin": "https://m.ctrip.com",
+            "phantom-token": hdrs.get("phantom-token") or "",
+            "cookie": self._cookies or "",
+        }
+        # Carry the anti-bot context headers that the page sets.
+        for k in (
+            "x-ctx-wclient-req",
+            "x-ctx-ubt-pageid",
+            "x-ctx-ubt-vid",
+            "x-ctx-ubt-sid",
+            "x-ctx-ubt-pvid",
+            "cookieorigin",
+            "w-payload-source",
+        ):
+            v = hdrs.get(k)
+            if v:
+                base[k] = v
+        return base
 
     def fetch_room(self, hotel_id: int | str) -> dict[str, Any]:
-        """Fetch full room status for one hotel via in-page fetch replay."""
-        assert self._page is not None
+        """Fetch full room status for one hotel via pure HTTP (token reuse)."""
         assert self._template is not None, "client not warmed up"
-        post = self._template["post"]
-        # Change hotelId in the JSON body (keep everything else identical).
         try:
-            body = json.loads(post)
+            body = json.loads(self._template["post"])
             body["search"]["hotelId"] = int(hotel_id)
         except Exception:
-            # Fallback: string-replace hotelId
-            body = None
-        payload = json.dumps(body) if body is not None else post
+            body = {"search": {"hotelId": int(hotel_id)}}
         try:
-            j = self._page.evaluate(
-                _FETCH_ROOM_SCRIPT,
-                {"url": self._template["url"], "post": payload, "hotelId": str(hotel_id)},
+            r = cffi_requests.post(
+                self._template["url"],
+                json=body,
+                headers=self._room_headers(),
+                impersonate="chrome",
+                timeout=20,
             )
+            j = r.json()
         except Exception as e:
             return {"error": str(e), "data": {}}
         if not isinstance(j, dict):
             return {"error": "non-json response", "data": {}}
         return j
 
-    def fetch_room_batch(self, hotel_ids: list[int | str]) -> list[dict[str, Any]]:
-        """Serial batch fetch (mandatory — concurrent in-page fetches get blocked)."""
-        out: list[dict[str, Any]] = []
-        for hid in hotel_ids:
-            try:
-                j = self.fetch_room(hid)
-            except Exception as e:
-                j = {"error": str(e), "data": {}}
-            out.append(j)
-            time.sleep(float(self.cfg.get("delay_ms") or 0) / 1000.0)
-        return out
+    def fetch_room_batch(
+        self,
+        hotel_ids: list[int | str],
+        *,
+        max_workers: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Fetch rooms for many hotels with a thread pool (pure HTTP)."""
+        if max_workers <= 1:
+            out = []
+            for hid in hotel_ids:
+                try:
+                    out.append(self.fetch_room(hid))
+                except Exception as e:
+                    out.append({"error": str(e), "data": {}})
+                time.sleep(float(self.cfg.get("delay_ms") or 0) / 1000.0)
+            return out
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results: dict[int | str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(self.fetch_room, hid): hid for hid in hotel_ids}
+            for fut in as_completed(futs):
+                hid = futs[fut]
+                try:
+                    results[hid] = fut.result()
+                except Exception as e:
+                    results[hid] = {"error": str(e), "data": {}}
+        return [results[hid] for hid in hotel_ids]
 
     # -- album / additional -------------------------------------------------
 

@@ -3,7 +3,7 @@
 抓取携程**酒店信息 + 房态/房价**。只有一套程序、一个 `data/` 输出目录。
 
 支持两种抓取模式（`config.yaml` 里的 `mode`）：
-- **`api`（推荐）**：列表走纯 HTTP（curl_cffi 模拟浏览器 TLS 指纹），房态走「单个无头浏览器页面 + 页面内 API 请求」。资源占用极低，实测约 **0.8 秒/家**。
+- **`api`（推荐）**：列表 + 房态全部走**纯 HTTP**（curl_cffi 模拟 Chrome TLS 指纹）。仅启动时用一次无头浏览器获取 `phantom-token`，之后**多线程并发抓取**，实测 **0.15 秒/家**。
 - **`browser`（原方案）**：多浏览器 worker 逐个导航酒店详情页解析 DOM。
 
 ## 背景 / 逆向结论
@@ -13,15 +13,15 @@
 | 接口 | 纯 HTTP | 说明 |
 |------|---------|------|
 | `soa2/31454/.../fetchHotelList` | ✅ 可通 | 列表；参数 `destination:{type:2,geo:{cityId}}` |
-| `soa2/33278/.../getHotelRoomListInland` | ❌ 203/4030 | 房态；被 `phantom-token` 签名保护 |
-| 图片 `soa2/12465/h5-json/getHotelAlbumPicture` | ❌ | 同样受签名保护 |
-| 周边 `soa2/33278/.../getDetailAdditionalInfo` | ❌ | 同样受签名保护 |
+| `soa2/33278/.../getHotelRoomListInland` | ✅ 可通 | 房态；需带有效的 `phantom-token` |
+| 图片 `soa2/12465/h5-json/getHotelAlbumPicture` | ⚠️ | 需带 `phantom-token`（列表自带封面图可用） |
+| 周边 `soa2/33278/.../getDetailAdditionalInfo` | ⚠️ | 需带 `phantom-token` |
 
-**关键机制**：房态接口依赖请求头 `phantom-token`（页面 JS `window.signature()` 生成，格式 `1004-h5common-...`）。它由浏览器 JS 动态生成、绑定首次请求的酒店，纯 `requests`/`curl_cffi` 无法跨酒店复用。
+**关键机制**：房态接口依赖请求头 `phantom-token`（页面 JS `window.signature()` 生成，格式 `1004-h5common-<base64>`）。它是**短期有效**（约 20–60 秒）的签名 token，但**不绑定酒店**——同一个 token 可以抓任意多家酒店。
 
-**可行方案**：保持 **1 个无头浏览器页面**预热，捕获页面自动发出的完整请求模板（URL + POST body），然后**在页面 JS 上下文内**用 `fetch` 重放，只改 `hotelId`。浏览器 JS 会为每个请求重新生成有效签名，实测串行 100% 成功。
+**方案**：启动时用**一个无头浏览器页面**预热，捕获页面自动发出的房态请求模板（URL + POST body + headers 里的 `phantom-token` + cookie），之后**完全退出浏览器**，用 curl_cffi 纯 HTTP 多线程复用该 token 批量抓房态。token 过期时自动重新预热。
 
-> ⚠️ 并发踩坑：在页面内用 `Promise.all` 并发请求会触发风控返回空数据。**必须串行**。要提速就多开几个浏览器页面（`workers`），每个页面内部串行。
+实测性能（沙箱数据中心 IP）：**并发 10 家 1.4 秒，10/10 成功**；串行 15 家 11.5 秒。家宽 IP 下更快更稳。
 
 **不需要登录携程账号。** 默认不采集价格，只抓房型/床型/窗户/面积/早餐/取消/入住人数等。
 
@@ -47,8 +47,9 @@ python -m ctrip_hotel crawl --mode api
 - `city_id`：携程城市 ID（1 北京，2 上海…）
 - `check_in` / `check_out`：入住日期
 - `max_hotels`：本次抓房态的酒店数
-- `workers`：并行浏览器页面数（API 模式）
-- `delay_ms`：酒店间隔（API 模式建议 600–1000ms，降低风控）
+- `workers`：并行 worker 数（API 模式每个 worker 一个 token）
+- `api_workers`：每个 worker 内并发线程数（API 模式建议 8–16）
+- `delay_ms`：每批间隔（API 模式建议 0–200ms）
 - `seed_hotel_id`：API 预热用的任意酒店 ID
 - `output_dir`：固定为 `data`
 

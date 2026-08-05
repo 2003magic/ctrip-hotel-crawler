@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ctrip_hotel.hotel_parse import merge_hotel_full
@@ -148,23 +149,48 @@ def _room_from_physic(proom: dict[str, Any]) -> dict[str, Any]:
 
 
 def _offer_from_sale(sroom: dict[str, Any]) -> dict[str, Any]:
+    """Build an offer from a saleRoomMap entry.
+
+    New (2026) saleRoomMap structure has no mealInfo/cancelInfo/guestCountInfo
+    top-level fields — those live in tagInfoList ("2人入住", "含X份早餐",
+    "免费取消"...) and serviceTagList ("立即确认"...). We scan both tag lists.
+    """
+    tags: list[str] = []
+    for tl in (sroom.get("tagInfoList") or []) + (sroom.get("serviceTagList") or []):
+        if isinstance(tl, dict) and tl.get("tagTitle"):
+            tags.append(str(tl["tagTitle"]))
+    meal = None
+    cancel = None
+    occupancy = None
+    for t in tags:
+        if "早餐" in t or "含早" in t or "无早" in t:
+            meal = t
+        elif "取消" in t or "不可退" in t:
+            cancel = t
+        elif "人入住" in t or "成人" in t:
+            m = re.search(r"(\d+)\s*人", t)
+            if m:
+                occupancy = int(m.group(1))
+    confirm = None
+    for t in tags:
+        if "确认" in t or "立即" in t:
+            confirm = t
+            break
     booking = sroom.get("bookingStatusInfo") or {}
-    meal = sroom.get("mealInfo") or {}
-    cancel = sroom.get("cancelInfo") or {}
-    confirm = sroom.get("confirmInfo") or {}
     pay = sroom.get("paymentInfo") or {}
-    guest = sroom.get("guestCountInfo") or {}
     left = booking.get("remainRoomQuantity")
     if left is not None and int(left) >= 999:
         left = None
     return {
         "offer_id": sroom.get("id"),
-        "meal": meal.get("title"),
-        "cancel": cancel.get("title"),
-        "confirm": confirm.get("title"),
+        "meal": meal,
+        "cancel": cancel,
+        "confirm": confirm,
         "pay": pay.get("subTitle") or pay.get("paymentTitleNew"),
-        "occupancy": guest.get("guestCount"),
+        "occupancy": occupancy,
         "left": left,
+        "price_str": sroom.get("priceStr"),
+        "room_attr": sroom.get("roomAttr"),
     }
 
 

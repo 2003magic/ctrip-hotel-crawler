@@ -18,7 +18,8 @@ seed_hotel_id: 1           # API 模式预热用的任意酒店 ID（页面会�
 seed_hotel_ids: []         # 可选：更多预热酒店 ID（若单个 seed 未触发房态接口会自动换）
 
 # --- 多开 / 分组 / 防重复 ---
-workers: 2                 # API 模式=并行无头页面数；browser 模式=并行浏览器数
+workers: 2                 # API 模式=并行 worker 数（每 worker 一个 token）；browser 模式=并行浏览器数
+api_workers: 8             # API 模式每个 worker 内的并发线程数（建议 8–16）
 workers_headed: false      # 详情 worker 是否显示窗口；false=无头多开更稳
 skip_done: true            # 跳过 data/state/done.jsonl 里已成功的酒店
 group_by: round_robin      # 酒店轮询分给各 worker
