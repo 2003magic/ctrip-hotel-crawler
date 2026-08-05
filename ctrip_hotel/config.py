@@ -30,6 +30,17 @@ DEFAULTS: dict[str, Any] = {
     "workers_headed": False,  # detail workers headless by default when multi
     "skip_done": True,  # skip hotels already in data/state/done.jsonl
     "group_by": "round_robin",
+    # API mode: mode: "api" uses pure-HTTP list + single headless page for room
+    # status. Leave unset / "browser" for the original all-browser behavior.
+    "mode": "browser",
+    "page_size": 20,
+    "seed_hotel_id": 1,
+    "api_headed": False,  # API 模式浏览器是否显示窗口（首次过人机验证时可设 true）
+    # Optional proxies (e.g. http://ip:port). List fetch can rotate through
+    # `proxy_list`; browser warmup uses `proxy`.
+    "proxy": None,
+    "proxy_list": [],
+    "proxy_api_url": None,  # e.g. xiongmaodaili extract API returning {obj:[{ip,port}]}
 }
 
 

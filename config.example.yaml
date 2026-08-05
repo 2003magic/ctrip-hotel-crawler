@@ -1,24 +1,41 @@
 # Copy to config.yaml and edit.
 # Only one config + one data/ directory — do not maintain parallel crawlers.
 
+# --- 抓取模式 ---
+# mode: "api"     纯 HTTP 列表 + 单个无头浏览器页面抓房态（推荐，资源占用低、速度快）
+# mode: "browser" 原方案：多浏览器 worker 逐个导航页面（保留兼容）
+mode: api
+
 city_id: 1                 # 1=北京 2=上海 7=成都 …（携程城市 ID）
 city_name: 北京
 check_in: null             # YYYY-MM-DD；null = 今天+7
 check_out: null            # YYYY-MM-DD；null = check_in+1
 pages: 1                   # 列表翻页数（每页约 10–25 家，视页面而定）
 max_hotels: 20             # 本次最多抓几家酒店的房态；null=不限制
-delay_ms: 1200             # 每个 worker 内酒店间隔，降低风控
+delay_ms: 800              # 每个 worker 内酒店间隔（API 模式建议 600–1000ms）
+page_size: 20              # 列表每页条数（上限约 20）
+seed_hotel_id: 1           # API 模式预热用的任意酒店 ID（页面会用它生成签名模板）
+seed_hotel_ids: []         # 可选：更多预热酒店 ID（若单个 seed 未触发房态接口会自动换）
 
 # --- 多开 / 分组 / 防重复 ---
-workers: 2                 # 并行浏览器数（每开一个独立 profile）
+workers: 2                 # API 模式=并行无头页面数；browser 模式=并行浏览器数
 workers_headed: false      # 详情 worker 是否显示窗口；false=无头多开更稳
 skip_done: true            # 跳过 data/state/done.jsonl 里已成功的酒店
 group_by: round_robin      # 酒店轮询分给各 worker
 
-headed: true               # 拉列表的主浏览器；首次便于过人机验证
+headed: true               # browser 模式：首次显示窗口便于过人机验证
+api_headed: false          # API 模式：浏览器是否显示窗口（首次过人机验证可改 true）
 verify_wait_sec: 180
 unlock_price: false        # 不点「解锁优惠」，不需要价格
 open_room_detail: false    # 多开时建议 false，加快速度
 room_detail_limit: 3
 browser_channel: msedge
 output_dir: data
+
+# --- 代理（可选，规避 IP 风控） ---
+# proxy: http://ip:port            # 浏览器预热/房态抓取用的单个代理
+# proxy_list: []                   # 列表请求轮换的代理池（http://ip:port 列表）
+# proxy_api_url: null              # 代理提取 API（返回 {"obj":[{"ip":..,"port":..}]}）
+proxy: null
+proxy_list: []
+proxy_api_url: null

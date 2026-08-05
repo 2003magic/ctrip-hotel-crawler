@@ -55,6 +55,7 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config) if args.config else None)
     if args.headed is not None:
         cfg["headed"] = args.headed
+        cfg["api_headed"] = args.headed
     if args.city_id is not None:
         cfg["city_id"] = args.city_id
     if args.max_hotels is not None:
@@ -63,13 +64,15 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         cfg["workers"] = args.workers
     if args.no_skip_done:
         cfg["skip_done"] = False
+    if args.mode is not None:
+        cfg["mode"] = args.mode
 
     run_dir = new_run_dir(cfg["output_dir"])
     write_json(run_dir / "config.used.json", cfg)
     workers = max(int(cfg.get("workers") or 1), 1)
     print(
         f"运行目录: {run_dir}\n"
-        f"城市={cfg['city_id']} {cfg.get('city_name', '')} "
+        f"模式={cfg.get('mode', 'browser')} 城市={cfg['city_id']} {cfg.get('city_name', '')} "
         f"{cfg['check_in']}~{cfg['check_out']} | workers={workers} "
         f"skip_done={cfg.get('skip_done', True)}"
     )
@@ -109,25 +112,69 @@ def cmd_diagnose(_: argparse.Namespace) -> int:
     cfg = load_config()
     print("诊断：抓 1 家完整结构（含图片 URL）…")
     try:
-        with CtripHotelClient(cfg, worker_id=None) as client:
-            payloads, cards = client.fetch_hotel_list()
-            hotels = []
-            for p in payloads:
-                hotels.extend(normalize_hotels_from_list_api(p))
-            if not hotels:
-                hotels = normalize_hotels_from_dom(cards)
+        if cfg.get("mode") == "api":
+            from ctrip_hotel.api_client import (
+                ApiRoomClient,
+                build_fetch_result,
+                extract_proxy_pool,
+                fetch_hotel_list_pure,
+                normalize_list_payloads,
+            )
+
+            proxies = extract_proxy_pool(cfg)
+            items = fetch_hotel_list_pure(
+                city_id=cfg["city_id"],
+                check_in=cfg["check_in"],
+                check_out=cfg["check_out"],
+                pages=1,
+                proxies=proxies,
+            )
+            hotels = normalize_list_payloads(items)
             if not hotels:
                 print("未拿到列表")
                 return 2
             h = hotels[0]
-            result = client.fetch_room_status(h["hotel_id"])
-            doc = build_hotel_document(
-                hotel_meta=h,
-                page_hotel=result.get("page_hotel"),
-                fetch_result=result,
-                check_in=cfg["check_in"],
-                check_out=cfg["check_out"],
-            )
+            print(f"诊断酒店: {h['hotel_id']} {h.get('name')}")
+            with ApiRoomClient(cfg, seed_hotel_id=h["hotel_id"]) as client:
+                room = client.fetch_room(h["hotel_id"])
+                album = client.fetch_album(h["hotel_id"])
+                additional = client.fetch_additional(h["hotel_id"])
+                result = build_fetch_result(
+                    hotel_id=h["hotel_id"],
+                    hotel_meta=h,
+                    room_payload=room,
+                    album_payload=album,
+                    additional_payload=additional,
+                    check_in=cfg["check_in"],
+                    check_out=cfg["check_out"],
+                )
+                doc = build_hotel_document(
+                    hotel_meta=h,
+                    page_hotel=result.get("page_hotel"),
+                    fetch_result=result,
+                    check_in=cfg["check_in"],
+                    check_out=cfg["check_out"],
+                )
+        else:
+            with CtripHotelClient(cfg, worker_id=None) as client:
+                payloads, cards = client.fetch_hotel_list()
+                hotels = []
+                for p in payloads:
+                    hotels.extend(normalize_hotels_from_list_api(p))
+                if not hotels:
+                    hotels = normalize_hotels_from_dom(cards)
+                if not hotels:
+                    print("未拿到列表")
+                    return 2
+                h = hotels[0]
+                result = client.fetch_room_status(h["hotel_id"])
+                doc = build_hotel_document(
+                    hotel_meta=h,
+                    page_hotel=result.get("page_hotel"),
+                    fetch_result=result,
+                    check_in=cfg["check_in"],
+                    check_out=cfg["check_out"],
+                )
             print(
                 "hotel",
                 doc["hotel"].get("name"),
@@ -209,6 +256,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_crawl.add_argument("--workers", type=int, default=None)
     p_crawl.add_argument("--headed", action=argparse.BooleanOptionalAction, default=None)
     p_crawl.add_argument("--no-skip-done", action="store_true")
+    p_crawl.add_argument(
+        "--mode",
+        choices=["api", "browser"],
+        default=None,
+        help="抓取模式：api=纯HTTP列表+单页抓房态；browser=原浏览器方案",
+    )
     p_crawl.set_defaults(func=cmd_crawl)
 
     p_diag = sub.add_parser("diagnose", help="检查结构是否完整")

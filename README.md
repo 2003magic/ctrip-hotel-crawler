@@ -2,21 +2,28 @@
 
 抓取携程**酒店信息 + 房态/房价**。只有一套程序、一个 `data/` 输出目录。
 
-## 为什么不用“多套爬虫”
+支持两种抓取模式（`config.yaml` 里的 `mode`）：
+- **`api`（推荐）**：列表走纯 HTTP（curl_cffi 模拟浏览器 TLS 指纹），房态走「单个无头浏览器页面 + 页面内 API 请求」。资源占用极低，实测约 **0.8 秒/家**。
+- **`browser`（原方案）**：多浏览器 worker 逐个导航酒店详情页解析 DOM。
 
-景区项目那套思路是对的：走 `m.ctrip.com/restapi/soa2/...` 手机端/H5 JSON，而不是解析 PC HTML。
+## 背景 / 逆向结论
 
-本机实测（2026-08）：
+走 `m.ctrip.com/restapi/soa2/...` 手机端/H5 JSON，而不是解析 PC HTML。本机实测（2026-08）：
 
-| 接口 | 状态 |
-|------|------|
-| `soa2/31454/.../fetchHotelList` | 仍是列表接口（同族 `getHotelCommonFilter` 可通） |
-| `soa2/33278/.../getHotelRoomListInland` | 仍是房态接口 |
-| 裸 `requests` | 列表 `ResultId=201`，房态 `htlSpiderActionErrorCode=4030` |
+| 接口 | 纯 HTTP | 说明 |
+|------|---------|------|
+| `soa2/31454/.../fetchHotelList` | ✅ 可通 | 列表；参数 `destination:{type:2,geo:{cityId}}` |
+| `soa2/33278/.../getHotelRoomListInland` | ❌ 203/4030 | 房态；被 `phantom-token` 签名保护 |
+| 图片 `soa2/12465/h5-json/getHotelAlbumPicture` | ❌ | 同样受签名保护 |
+| 周边 `soa2/33278/.../getDetailAdditionalInfo` | ❌ | 同样受签名保护 |
 
-**不需要登录携程账号。** 你在电脑上未登录也能看酒店详情 /「房间详情」；程序之前提示“登录”，其实是自动化被风控页拦截，不是账号门槛。
+**关键机制**：房态接口依赖请求头 `phantom-token`（页面 JS `window.signature()` 生成，格式 `1004-h5common-...`）。它由浏览器 JS 动态生成、绑定首次请求的酒店，纯 `requests`/`curl_cffi` 无法跨酒店复用。
 
-做法：用浏览器按真人路径打开列表 → 酒店详情 → 解析页面上的房型（并可点「房间详情」「解锁优惠」）。若页面顺便打出 SOA2 JSON 也会收下，但**以页面可见信息为准**。
+**可行方案**：保持 **1 个无头浏览器页面**预热，捕获页面自动发出的完整请求模板（URL + POST body），然后**在页面 JS 上下文内**用 `fetch` 重放，只改 `hotelId`。浏览器 JS 会为每个请求重新生成有效签名，实测串行 100% 成功。
+
+> ⚠️ 并发踩坑：在页面内用 `Promise.all` 并发请求会触发风控返回空数据。**必须串行**。要提速就多开几个浏览器页面（`workers`），每个页面内部串行。
+
+**不需要登录携程账号。** 默认不采集价格，只抓房型/床型/窗户/面积/早餐/取消/入住人数等。
 
 ## 快速开始
 
@@ -27,22 +34,23 @@ python -m venv .venv
 pip install -r requirements.txt
 python -m playwright install chromium
 python -m ctrip_hotel init
-python -m ctrip_hotel diagnose
-python -m ctrip_hotel crawl
+python -m ctrip_hotel crawl --mode api
 ```
 
-首次请保持 `headed: true`。若弹出**人机验证/滑块**（仍不必登录），点一下即可；默认最多等 `verify_wait_sec: 180` 秒。会话在 `.browser-profile/`。
-
-默认**不点击「解锁优惠」**，也不采集价格；只抓房型/床型/窗户/面积/早餐/取消等。
+首次请保持 `headed: true`。若弹出**人机验证/滑块**（仍不必登录），点一下即可；默认最多等 `verify_wait_sec: 180` 秒。通过后可将 `headed` 改为 `false` 无头运行。
 
 ## 配置
 
 复制自 `config.example.yaml` → `config.yaml`：
 
+- `mode`：`api` 或 `browser`
 - `city_id`：携程城市 ID（1 北京，2 上海…）
 - `check_in` / `check_out`：入住日期
 - `max_hotels`：本次抓房态的酒店数
-- `output_dir`：固定为 `data`（不要另开第二套目录）
+- `workers`：并行浏览器页面数（API 模式）
+- `delay_ms`：酒店间隔（API 模式建议 600–1000ms，降低风控）
+- `seed_hotel_id`：API 预热用的任意酒店 ID
+- `output_dir`：固定为 `data`
 
 ## 输出（每次一个 run 子目录）
 
@@ -66,13 +74,13 @@ python -m ctrip_hotel preview
 
 ## 多开 / 分组 / 防重复
 
-- `workers: 2`：同时开多个浏览器（各自 `.browser-profile/w0`、`w1`…）
+- `workers: 2`：API 模式 = 2 个并行无头页面；browser 模式 = 2 个浏览器
 - 酒店按 **round-robin** 分给各组，互不重叠
 - `skip_done: true`：成功写过的酒店记入 `data/state/done.jsonl`，下次自动跳过  
   键：`城市:酒店ID:入住:离店`
 
 ```powershell
-python -m ctrip_hotel crawl --workers 2 --max-hotels 6
+python -m ctrip_hotel crawl --mode api --workers 2 --max-hotels 6
 python -m ctrip_hotel status
 python -m ctrip_hotel crawl --no-skip-done   # 强制重抓
 ```
@@ -82,8 +90,8 @@ python -m ctrip_hotel crawl --no-skip-done   # 强制重抓
 ```powershell
 python -m ctrip_hotel init
 python -m ctrip_hotel diagnose
-python -m ctrip_hotel crawl --max-hotels 5
-python -m ctrip_hotel crawl --city-id 2 --workers 2
+python -m ctrip_hotel crawl --mode api --max-hotels 5
+python -m ctrip_hotel crawl --mode api --city-id 2 --workers 2
 ```
 
 ## 说明
