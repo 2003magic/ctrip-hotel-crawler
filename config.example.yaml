@@ -1,0 +1,24 @@
+# Copy to config.yaml and edit.
+# Only one config + one data/ directory — do not maintain parallel crawlers.
+
+city_id: 1                 # 1=北京 2=上海 7=成都 …（携程城市 ID）
+city_name: 北京
+check_in: null             # YYYY-MM-DD；null = 今天+7
+check_out: null            # YYYY-MM-DD；null = check_in+1
+pages: 1                   # 列表翻页数（每页约 10–25 家，视页面而定）
+max_hotels: 20             # 本次最多抓几家酒店的房态；null=不限制
+delay_ms: 1200             # 每个 worker 内酒店间隔，降低风控
+
+# --- 多开 / 分组 / 防重复 ---
+workers: 2                 # 并行浏览器数（每开一个独立 profile）
+workers_headed: false      # 详情 worker 是否显示窗口；false=无头多开更稳
+skip_done: true            # 跳过 data/state/done.jsonl 里已成功的酒店
+group_by: round_robin      # 酒店轮询分给各 worker
+
+headed: true               # 拉列表的主浏览器；首次便于过人机验证
+verify_wait_sec: 180
+unlock_price: false        # 不点「解锁优惠」，不需要价格
+open_room_detail: false    # 多开时建议 false，加快速度
+room_detail_limit: 3
+browser_channel: msedge
+output_dir: data
