@@ -12,6 +12,12 @@ from ctrip_hotel.api_client import (
     fetch_hotel_list_pure,
     normalize_list_payloads,
 )
+from ctrip_hotel.intl_client import (
+    IntlRoomClient,
+    fetch_hkd_cny_rate,
+    merge_prices_into_doc,
+    normalize_intl_prices,
+)
 from ctrip_hotel.client import CtripHotelClient, save_raw_payloads
 from ctrip_hotel.completeness import document_gaps
 from ctrip_hotel.normalize import (
@@ -321,6 +327,41 @@ def _worker_crawl_api(
             if delay > 0:
                 time.sleep(delay)
 
+    # --- 国际版价格抓取（可选）：基本信息国内跑，价格走 hk.trip.com ---
+    if cfg.get("intl_price"):
+        try:
+            rate = fetch_hkd_cny_rate()
+            intl_ids = [h["hotel_id"] for h in hotels]
+            with IntlRoomClient(cfg, worker_id=worker_id) as intl:
+                intl_payloads = intl.fetch_room_batch(
+                    intl_ids, max_workers=max(int(cfg.get("intl_workers") or 4), 1)
+                )
+            doc_index = {d.get("hotel_id"): i for i, d in enumerate(docs)}
+            merged = 0
+            for h, payload in zip(hotels, intl_payloads):
+                hid = h["hotel_id"]
+                save_raw_payloads(worker_dir, f"intl_room_{hid}", [payload])
+                if not payload or payload.get("error"):
+                    continue
+                price_info = normalize_intl_prices(
+                    payload,
+                    check_in=cfg["check_in"],
+                    check_out=cfg["check_out"],
+                    rate=rate,
+                )
+                if not price_info.get("rooms"):
+                    continue
+                idx = doc_index.get(hid)
+                if idx is None:
+                    continue
+                merged_doc = merge_prices_into_doc(docs[idx], price_info)
+                docs[idx] = merged_doc
+                write_json(hotels_dir / f"{hid}.json", merged_doc)
+                merged += 1
+            print(f"[w{worker_id}] intl 价格合并 {merged}/{len(hotels)} 家 (汇率 {rate:.4f})")
+        except Exception as e:
+            print(f"[w{worker_id}] intl 价格抓取失败: {e}")
+
     write_json(
         worker_dir / "summary.json",
         {"worker_id": worker_id, "ok": ok_ids, "err": err_ids, "docs": len(docs)},
@@ -393,6 +434,8 @@ def crawl_rooms_parallel(
                 "address": h.get("address"),
                 "cover": (h.get("images") or [None])[0],
                 "room_count": len(d.get("rooms") or []),
+                "min_price_hkd": h.get("min_price_hkd"),
+                "min_price_cny": h.get("min_price_cny"),
                 "file": f"hotels/{d.get('hotel_id')}.json",
             }
         )

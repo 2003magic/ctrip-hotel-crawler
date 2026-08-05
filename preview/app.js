@@ -42,6 +42,7 @@ async function bootIndex() {
             ${h.score != null ? `<span class="score">${esc(h.score)}</span>` : ""}
             <div style="margin-top:8px">${esc(h.address || "地址待补全")}</div>
             <div style="margin-top:6px">房型 ${esc(h.room_count ?? 0)} 个</div>
+            ${h.min_price_hkd != null ? `<div style="margin-top:6px;font-weight:700;color:var(--accent,#ff5500)">HK$${esc(fmt(h.min_price_hkd))} 起${h.min_price_cny != null ? ` ≈¥${esc(fmt(h.min_price_cny))}` : ""}</div>` : ""}
           </div>
         </div>
       </a>`
@@ -89,6 +90,7 @@ function roomCard(room, idx) {
     .map((o) => {
       const left =
         o.left != null ? `<div class="left">仅剩${esc(o.left)}间</div>` : "";
+      const price = priceHtml(o);
       return `<div class="offer">
         <div>
           <span class="pill">${esc(o.meal || "-")}</span>
@@ -97,7 +99,20 @@ function roomCard(room, idx) {
           <span class="pill">${esc(o.pay || "")}</span>
         </div>
         <div>${o.occupancy != null ? `可住 ${esc(o.occupancy)} 人` : "-"}</div>
-        <div>${left}<button class="btn" type="button">查看政策</button></div>
+        <div>${price}${left}<button class="btn" type="button">查看政策</button></div>
+      </div>`;
+    })
+    .join("");
+
+  // International prices attached per physical room (plans under this room).
+  const pricePlans = (room.prices || [])
+    .map((p) => {
+      const p1 = p.price_hkd != null ? `HK$${esc(fmt(p.price_hkd))}` : "-";
+      const p2 = p.price_cny != null ? `<span class="dim">≈¥${esc(fmt(p.price_cny))}</span>` : "";
+      const fold = p.folded ? `<span class="pill">折叠</span>` : "";
+      return `<div class="offer">
+        <div><span class="pill">${esc(p.summary || p.room_name || "")}</span><span class="pill">${esc(p.meal || "")}</span>${fold}</div>
+        <div style="font-weight:700;color:var(--accent,#ff5500)">${p1} ${p2}</div>
       </div>`;
     })
     .join("");
@@ -120,9 +135,39 @@ function roomCard(room, idx) {
         <span>${esc(room.wifi || "")}</span>
       </div>
       <button class="linkish" type="button" data-open="${idx}">房间详情</button>
+      ${pricePlans ? `<div class="price-plans"><div class="price-plans-title">价格（国际版）</div>${pricePlans}</div>` : ""}
       <div class="offers">${offers || '<div class="meta" style="padding-top:10px">暂无售卖政策行</div>'}</div>
     </div>
   </article>`;
+}
+
+function priceInfoLine(h) {
+  const pi = h.price_info;
+  const min = h.min_price_hkd;
+  if (!pi && min == null) return "";
+  const r = pi && pi.exchange_rate ? pi.exchange_rate : 0.9;
+  const minCny = h.min_price_cny != null ? h.min_price_cny : (min != null ? min * r : null);
+  let s = "";
+  if (min != null) {
+    s += ` · <span style="font-weight:700;color:var(--accent,#ff5500)">HK$${esc(fmt(min))} 起${minCny != null ? ` ≈¥${esc(fmt(minCny))}` : ""}</span>`;
+  }
+  if (pi && pi.exchange_rate) {
+    s += ` <span class="dim">(汇率 ${esc(pi.exchange_rate)})</span>`;
+  }
+  return s;
+}
+
+function fmt(n) {
+  if (n == null) return "";
+  return Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function priceHtml(o) {
+  const hkd = o.price_hkd != null ? `HK$${esc(fmt(o.price_hkd))}` : "";
+  const cny = o.price_cny != null ? `<span class="dim">≈¥${esc(fmt(o.price_cny))}</span>` : "";
+  return hkd || cny
+    ? `<span style="font-weight:700;color:var(--accent,#ff5500)">${hkd} ${cny}</span>`
+    : "";
 }
 
 function openModal(room) {
@@ -173,7 +218,7 @@ async function bootHotel() {
   window.__ROOMS__ = rooms;
 
   document.getElementById("title").textContent = h.name || id;
-  document.getElementById("sub").textContent = `${doc.check_in || ""} ~ ${doc.check_out || ""} · source=${doc.source || "-"}`;
+  document.getElementById("sub").textContent = `${doc.check_in || ""} ~ ${doc.check_out || ""} · source=${doc.source || "-"}${priceInfoLine(h)}`;
   document.getElementById("address").textContent = h.address || "";
   document.getElementById("stars").textContent = h.star ? "◆".repeat(Number(h.star) || 0) : "";
   document.getElementById("score").textContent = h.score ?? "-";

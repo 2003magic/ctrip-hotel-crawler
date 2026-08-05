@@ -37,6 +37,12 @@ DEFAULTS: dict[str, Any] = {
     "seed_hotel_id": 1,
     "api_headed": False,  # API 模式浏览器是否显示窗口（首次过人机验证时可设 true）
     "api_workers": 8,  # API 模式每个 worker 内的并发线程数
+    # International-site price fetch (hk.trip.com) — returns per-room prices in
+    # HKD without login; prices are converted to CNY with a live rate.
+    "intl_price": False,  # 是否抓国际版港币价格（默认关，开启后基本信息国内跑+价格国际版跑）
+    "intl_workers": 4,  # 国际版价格抓取并发线程数
+    "intl_headed": False,  # 国际版浏览器是否显示窗口
+    "intl_proxy": None,  # 国际版专用代理；默认用 proxy
     # Optional proxies (e.g. http://ip:port). List fetch can rotate through
     # `proxy_list`; browser warmup uses `proxy`.
     "proxy": None,

@@ -33,6 +33,14 @@ room_detail_limit: 3
 browser_channel: msedge
 output_dir: data
 
+# --- 国际版价格（可选） ---
+# 国内版隐藏逐房型价格（priceStr='?'），国际版 hk.trip.com 未登录直接返回港币价格。
+# 开启后：基本信息仍走国内版，价格走国际版 getHotelRoomListOversea，港币按实时汇率折算人民币。
+# intl_price: true
+# intl_workers: 4                 # 国际版价格抓取并发线程数
+# intl_headed: false              # 国际版浏览器是否显示窗口
+# intl_proxy: null                # 国际版专用代理；默认复用 proxy
+
 # --- 代理（可选，规避 IP 风控） ---
 # proxy: http://ip:port            # 浏览器预热/房态抓取用的单个代理
 # proxy_list: []                   # 列表请求轮换的代理池（http://ip:port 列表）

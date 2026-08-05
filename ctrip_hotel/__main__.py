@@ -66,6 +66,8 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         cfg["skip_done"] = False
     if args.mode is not None:
         cfg["mode"] = args.mode
+    if args.intl_price is not None:
+        cfg["intl_price"] = args.intl_price
 
     run_dir = new_run_dir(cfg["output_dir"])
     write_json(run_dir / "config.used.json", cfg)
@@ -261,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["api", "browser"],
         default=None,
         help="抓取模式：api=纯HTTP列表+单页抓房态；browser=原浏览器方案",
+    )
+    p_crawl.add_argument(
+        "--intl-price",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="抓国际版(hk.trip.com)港币价格并折算人民币（基本信息仍走国内版）",
     )
     p_crawl.set_defaults(func=cmd_crawl)
 

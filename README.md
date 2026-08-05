@@ -73,6 +73,36 @@ python -m ctrip_hotel preview
 # 打开 http://127.0.0.1:8765/
 ```
 
+## 价格（国际版 hk.trip.com）
+
+国内版 `getHotelRoomListInland` 未登录时逐房型价格是 `'?'`（被登录墙保护）。
+
+**国际版逐房型价格（`getHotelRoomListOversea`）当前被 whaleguard 服务端封锁**：
+2026-08-05 实测，无论本机住宅 IP / 数据中心 IP / 香港节点，headless / headed / 真实 Chrome，
+页面自己发出的请求与纯 HTTP 重放全部返回 `4030`（`htlSpiderActionErrorCode`），随后跳登录页。
+**「未登录直接返回港币价」的说法未经证实**——该功能从未跑通过，需境外**住宅** IP 或登录态才可能解锁。
+
+验证脚本（`--proxy` 指定代理，`intl_check_proxy.py` 先查出口 IP 是否够格）：
+
+```powershell
+python intl_check_proxy.py --proxy http://ip:port     # 先查代理出口 IP 归属/类型
+python intl_check_proxy.py --proxy http://ip:port --test   # 查完直接跑国际版验证
+python intl_verify.py --proxy http://ip:port          # 国际版港币价格验证
+```
+
+`intl_check_proxy.py` 判定标准：境外（非 CN）且未被 ip-api 标记为 proxy/hosting 才算住宅 IP。
+注意：境外住宅 IP 是**必要条件但非充分条件**——2026-08 实测干净的 HK 家宽 IP 仍被 4030，
+最终以 `intl_verify.py` 能否出价格为准。
+
+**已确认可用的替代价格源**（无需登录、纯 HTTP）：
+- 国际版**酒店底价（HK$ 起）**：抓详情页 HTML 即可，如 `最優惠房價由 HK$102 起`
+- 国内版**酒店底价（¥）**：`getHotelRoomListInland` → `hotelDetailBarInfo.price`
+- 国内版**预售套餐价（¥）**：`getDetailAdditionalInfo` → `inStoreProduct.productList`
+
+输出结构（若未来跑通）为 `hotel.price_info`：`总房型(物理房型) → 子房型(方案)`，
+每个方案含 `price_hkd` / `price_cny` / `summary` / `meal` / `cancel` / `folded`。
+价格按实时汇率折算人民币（HKD→CNY，失败回退 0.9）。
+
 ## 多开 / 分组 / 防重复
 
 - `workers: 2`：API 模式 = 2 个并行无头页面；browser 模式 = 2 个浏览器
