@@ -327,12 +327,16 @@ def _worker_crawl_api(
             if delay > 0:
                 time.sleep(delay)
 
-    # --- 国际版价格抓取（可选）：基本信息国内跑，价格走 hk.trip.com ---
+    # --- 国际版价格抓取（可选）：补国内版，合并进同一酒店 JSON ---
     if cfg.get("intl_price"):
         try:
             rate = fetch_hkd_cny_rate()
             intl_ids = [h["hotel_id"] for h in hotels]
-            with IntlRoomClient(cfg, worker_id=worker_id) as intl:
+            # 必须用本组真实酒店 ID 预热；config 里的 seed=1 在国际站往往打不开房态
+            seed = intl_ids[0] if intl_ids else cfg.get("seed_hotel_id")
+            with IntlRoomClient(
+                cfg, worker_id=worker_id, seed_hotel_id=seed
+            ) as intl:
                 intl_payloads = intl.fetch_room_batch(
                     intl_ids, max_workers=max(int(cfg.get("intl_workers") or 4), 1)
                 )

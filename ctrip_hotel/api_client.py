@@ -231,7 +231,14 @@ class ApiRoomClient:
                 self._browser = self._pw.chromium.launch(**launch_kwargs)
         else:
             self._browser = self._pw.chromium.launch(**launch_kwargs)
-        context_kwargs: dict[str, Any] = {"locale": "zh-CN"}
+        # H5 detail page fires album/additional more reliably on a phone UA.
+        context_kwargs: dict[str, Any] = {
+            "locale": "zh-CN",
+            "viewport": {"width": 390, "height": 844},
+            "user_agent": MOBILE_UA,
+            "is_mobile": True,
+            "has_touch": True,
+        }
         proxy = self.cfg.get("proxy") or self.cfg.get("browser_proxy")
         if proxy:
             context_kwargs["proxy"] = {"server": str(proxy)}
@@ -278,9 +285,7 @@ class ApiRoomClient:
 
         captured: dict[str, Any] = {}
 
-        # Capture via a fetch hook injected before page load — more reliable than
-        # the page.on("request") event, and lets us grab the phantom-token header
-        # that the page automatically attaches.
+        # Capture via fetch hook + Playwright request events (XHR may bypass fetch).
         self._page.add_init_script(
             """
             window.__CTRIP_CAPTURED__ = window.__CTRIP_CAPTURED__ || {};
@@ -289,19 +294,20 @@ class ApiRoomClient:
                 try {
                     const [url, opts] = args;
                     const u = String(url);
+                    const post = opts ? String(opts.body || '') : '';
+                    let headers = {};
+                    try {
+                        if (opts && opts.headers) headers = JSON.parse(JSON.stringify(opts.headers));
+                    } catch (e) {}
                     if (u.includes('getHotelRoomListInland')) {
-                        window.__CTRIP_CAPTURED__.room = {
-                            url: u,
-                            post: opts ? String(opts.body || '') : '',
-                            headers: opts && opts.headers ? JSON.parse(JSON.stringify(opts.headers)) : {}
-                        };
-                    } else if (u.includes('gethotelalbumpicture') || u.includes('ctgethotelalbum')) {
+                        window.__CTRIP_CAPTURED__.room = { url: u, post, headers };
+                    } else if (u.toLowerCase().includes('gethotelalbumpicture') || u.toLowerCase().includes('ctgethotelalbum')) {
                         if (!window.__CTRIP_CAPTURED__.album) {
-                            window.__CTRIP_CAPTURED__.album = {url: u, post: opts ? String(opts.body || '') : ''};
+                            window.__CTRIP_CAPTURED__.album = { url: u, post, headers };
                         }
-                    } else if (u.includes('getdetailadditionalinfo')) {
+                    } else if (u.toLowerCase().includes('getdetailadditionalinfo')) {
                         if (!window.__CTRIP_CAPTURED__.additional) {
-                            window.__CTRIP_CAPTURED__.additional = {url: u, post: opts ? String(opts.body || '') : ''};
+                            window.__CTRIP_CAPTURED__.additional = { url: u, post, headers };
                         }
                     }
                 } catch(e) {}
@@ -309,35 +315,85 @@ class ApiRoomClient:
             };
             """
         )
+
+        def _on_request(req) -> None:
+            u = req.url or ""
+            ul = u.lower()
+            try:
+                post = req.post_data or ""
+            except Exception:
+                post = ""
+            if "gethotelroomlistinland" in ul and "room" not in captured:
+                captured["room"] = {
+                    "url": u,
+                    "post": post,
+                    "headers": dict(req.headers),
+                }
+            elif (
+                "gethotelalbumpicture" in ul or "ctgethotelalbum" in ul
+            ) and "album" not in captured:
+                captured["album"] = {"url": u, "post": post}
+            elif "getdetailadditionalinfo" in ul and "additional" not in captured:
+                captured["additional"] = {"url": u, "post": post}
+
+        self._page.on("request", _on_request)
+
         for i, sid in enumerate(seed_ids):
             url = (
                 f"https://m.ctrip.com/webapp/hotel/hoteldetail/{sid}.html"
                 f"?checkIn={self.cfg['check_in']}&checkOut={self.cfg['check_out']}"
             )
             print(f"  [api] warmup attempt {i + 1}/{len(seed_ids)}: seed={sid}")
-            self._page.evaluate("() => { window.__CTRIP_CAPTURED__ = {}; }")
+            # Keep network-captured room if any; clear JS bag for this navigation.
+            try:
+                self._page.evaluate("() => { window.__CTRIP_CAPTURED__ = {}; }")
+            except Exception:
+                pass
             try:
                 self._page.goto(url, timeout=60000)
             except Exception as e:
                 print(f"  [warmup] goto warning: {e}")
-            # Wait for the room API to fire; scroll to trigger album/additional.
-            deadline = time.time() + 15
+            # Wait for room API; keep scrolling so album/additional lazy-load too.
+            deadline = time.time() + 28
             while time.time() < deadline:
-                cap = self._page.evaluate("() => window.__CTRIP_CAPTURED__ || {}")
-                if cap.get("room"):
+                try:
+                    cap = self._page.evaluate("() => window.__CTRIP_CAPTURED__ || {}")
+                except Exception:
+                    cap = {}
+                if cap.get("room") and "room" not in captured:
                     captured["room"] = cap["room"]
-                    if cap.get("album"):
-                        captured["album"] = cap["album"]
-                    if cap.get("additional"):
-                        captured["additional"] = cap["additional"]
+                if cap.get("album"):
+                    captured["album"] = cap["album"]
+                if cap.get("additional"):
+                    captured["additional"] = cap["additional"]
+                if captured.get("room") and captured.get("additional"):
                     break
                 self._page.wait_for_timeout(400)
                 if time.time() < deadline:
                     try:
-                        self._page.mouse.wheel(0, 1200)
+                        self._page.mouse.wheel(0, 1600)
                     except Exception:
                         pass
             if "room" in captured:
+                # Extra scroll window for additional if still missing.
+                if "additional" not in captured:
+                    extra_deadline = time.time() + 12
+                    while time.time() < extra_deadline and "additional" not in captured:
+                        try:
+                            cap = self._page.evaluate(
+                                "() => window.__CTRIP_CAPTURED__ || {}"
+                            )
+                        except Exception:
+                            cap = {}
+                        if cap.get("additional"):
+                            captured["additional"] = cap["additional"]
+                        if cap.get("album"):
+                            captured["album"] = cap["album"]
+                        self._page.wait_for_timeout(400)
+                        try:
+                            self._page.mouse.wheel(0, 1800)
+                        except Exception:
+                            pass
                 break
 
         if "room" not in captured:

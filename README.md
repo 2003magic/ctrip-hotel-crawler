@@ -75,33 +75,29 @@ python -m ctrip_hotel preview
 
 ## 价格（国际版 hk.trip.com）
 
-国内版 `getHotelRoomListInland` 未登录时逐房型价格是 `'?'`（被登录墙保护）。
+国内版 `getHotelRoomListInland` 未登录时逐房型价格是 `'?'`（登录墙）。
+国际版 `getHotelRoomListOversea` **可以**返回逐房型港币价，但 WhaleGuard 要求：
 
-**国际版逐房型价格（`getHotelRoomListOversea`）当前被 whaleguard 服务端封锁**：
-2026-08-05 实测，无论本机住宅 IP / 数据中心 IP / 香港节点，headless / headed / 真实 Chrome，
-页面自己发出的请求与纯 HTTP 重放全部返回 `4030`（`htlSpiderActionErrorCode`），随后跳登录页。
-**「未登录直接返回港币价」的说法未经证实**——该功能从未跑通过，需境外**住宅** IP 或登录态才可能解锁。
+1. `phantom-token = window.signature(<精确 POST body>)`（**一次性 + 绑定 hotelId**）
+2. 浏览器预热时 **abort** 首个房态请求（避免 token 被页面消耗）
+3. **小批签发 → 立刻 HTTP**（默认批大小=`intl_workers`），避免 token 等太久过期
+4. **4030 自动重签重试**；**430 / 签名失效自动 rewarm** 后再试（`intl_http_retries` / `intl_rewarm_after`）
+5. HTTP 必须走与浏览器相同的**境外代理**；签名浏览器建议**有头**（无头易 HTTP 430）
 
-验证脚本（`--proxy` 指定代理，`intl_check_proxy.py` 先查出口 IP 是否够格）：
+旧误区：捕获页面已发出的 token 再重放 → 必 `4030`（token 已用过）。
 
 ```powershell
-python intl_check_proxy.py --proxy http://ip:port     # 先查代理出口 IP 归属/类型
-python intl_check_proxy.py --proxy http://ip:port --test   # 查完直接跑国际版验证
-python intl_verify.py --proxy http://ip:port          # 国际版港币价格验证
+python intl_verify.py --proxy http://127.0.0.1:7897
+python intl_verify.py --proxy http://127.0.0.1:7897 --max-hotels 3
+python -m ctrip_hotel crawl --mode api --intl-price --proxy http://127.0.0.1:7897
 ```
 
-`intl_check_proxy.py` 判定标准：境外（非 CN）且未被 ip-api 标记为 proxy/hosting 才算住宅 IP。
-注意：境外住宅 IP 是**必要条件但非充分条件**——2026-08 实测干净的 HK 家宽 IP 仍被 4030，
-最终以 `intl_verify.py` 能否出价格为准。
+输出 `hotel.price_info`：`总房型 → 子房型(方案)`，含 `price_hkd` / `price_cny` / `display_price` 等。
+港币按实时汇率折算人民币（失败回退 0.9）。
 
-**已确认可用的替代价格源**（无需登录、纯 HTTP）：
-- 国际版**酒店底价（HK$ 起）**：抓详情页 HTML 即可，如 `最優惠房價由 HK$102 起`
-- 国内版**酒店底价（¥）**：`getHotelRoomListInland` → `hotelDetailBarInfo.price`
-- 国内版**预售套餐价（¥）**：`getDetailAdditionalInfo` → `inStoreProduct.productList`
-
-输出结构（若未来跑通）为 `hotel.price_info`：`总房型(物理房型) → 子房型(方案)`，
-每个方案含 `price_hkd` / `price_cny` / `summary` / `meal` / `cancel` / `folded`。
-价格按实时汇率折算人民币（HKD→CNY，失败回退 0.9）。
+**备用价格源**（不依赖国际版房态）：
+- 国内版底价：`hotelDetailBarInfo.price`
+- 国内版预售套餐：`getDetailAdditionalInfo` → `inStoreProduct.productList`
 
 ## 多开 / 分组 / 防重复
 

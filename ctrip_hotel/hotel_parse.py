@@ -87,7 +87,7 @@ def nearby_from_additional(additional: dict[str, Any] | None) -> dict[str, list[
                 "distance": p.get("sinkDistanceText") or p.get("distanceDescText"),
                 "tags": p.get("tagNames") or [],
             }
-            tags = " ".join(item["tags"]) + " " + (item["name"] or "")
+            tags = " ".join(str(x) for x in (item["tags"] or [])) + " " + (item["name"] or "")
             icon = str(p.get("icon") or "")
             if "地铁" in tags or "metro" in icon:
                 out["metro"].append(item)
@@ -98,6 +98,107 @@ def nearby_from_additional(additional: dict[str, Any] | None) -> dict[str, list[
             else:
                 if len(out["other"]) < 12:
                     out["other"].append(item)
+    return out
+
+
+def introduction_from_additional(additional: dict[str, Any] | None) -> str | None:
+    """Build a short intro from getDetailAdditionalInfo.hotelIntroduction."""
+    if not additional:
+        return None
+    data = additional.get("data") or additional
+    intro = data.get("hotelIntroduction") or {}
+    if not isinstance(intro, dict):
+        return None
+    parts: list[str] = []
+    for card in intro.get("highLightCardList") or []:
+        if not isinstance(card, dict):
+            continue
+        name = (card.get("tagName") or "").strip()
+        desc = (card.get("tagDesc") or "").strip()
+        if name and desc:
+            parts.append(f"{name}：{desc}")
+        elif desc:
+            parts.append(desc)
+        elif name:
+            parts.append(name)
+    for sec in intro.get("sectionList") or []:
+        if not isinstance(sec, dict):
+            continue
+        desc = (sec.get("desc") or "").strip()
+        title = (sec.get("title") or "").strip()
+        if desc:
+            parts.append(desc)
+        elif title:
+            parts.append(title)
+    text = "\n".join(parts).strip()
+    if len(text) < 8:
+        # Fallback: facility comment snippets / tip titles
+        fac = data.get("hotelFacility") or {}
+        comments = ((fac.get("comment") or {}).get("commentList") or []) if isinstance(fac, dict) else []
+        tips = ((data.get("hotelReservationTips") or {}).get("tipList") or [])
+        bits: list[str] = []
+        for c in comments[:5]:
+            if isinstance(c, str) and c.strip():
+                bits.append(c.strip().strip("“”\""))
+        for t in tips[:3]:
+            if isinstance(t, dict) and t.get("title"):
+                bits.append(str(t["title"]))
+        text = "；".join(bits).strip()
+    if len(text) < 8:
+        return None
+    return text[:800]
+
+
+def facilities_from_additional(additional: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Flatten hotelFacility.category into [{name, tag?}]."""
+    if not additional:
+        return []
+    data = additional.get("data") or additional
+    fac = data.get("hotelFacility") or {}
+    if not isinstance(fac, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cat in fac.get("category") or []:
+        if not isinstance(cat, dict):
+            continue
+        cat_name = cat.get("categoryName") or ""
+        for item in cat.get("facilityList") or []:
+            if not isinstance(item, dict):
+                continue
+            name = (
+                item.get("facilityName")
+                or item.get("name")
+                or item.get("showName")
+                or item.get("facilityTitle")
+                or item.get("facilityShowName")
+                or item.get("title")
+            )
+            # some payloads nest the label
+            if not name and isinstance(item.get("facilityInfo"), dict):
+                fi = item["facilityInfo"]
+                name = fi.get("name") or fi.get("facilityName") or fi.get("title")
+            if not name:
+                continue
+            name = str(name).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            row: dict[str, Any] = {"name": name}
+            if cat_name:
+                row["tag"] = str(cat_name)
+            out.append(row)
+            if len(out) >= 60:
+                return out
+    # fallback: feature highlight names
+    if not out:
+        intro = data.get("hotelIntroduction") or {}
+        for card in (intro.get("highLightCardList") or []) if isinstance(intro, dict) else []:
+            if isinstance(card, dict) and card.get("tagName"):
+                n = str(card["tagName"]).strip()
+                if n and n not in seen:
+                    seen.add(n)
+                    out.append({"name": n})
     return out
 
 
@@ -120,6 +221,14 @@ def merge_hotel_full(
         return a or b
 
     images = album_imgs or list(page.get("images") or [])
+    api_intro = introduction_from_additional(additional)
+    api_fac = facilities_from_additional(additional)
+    page_fac = page.get("facilities") or []
+    base_fac = base.get("facilities") or []
+    features = page.get("features") or base.get("features") or []
+    if not features and api_fac:
+        features = [{"name": x["name"]} for x in api_fac[:12]]
+
     hotel = {
         "hotel_id": page.get("hotel_id") or base.get("hotel_id"),
         "name": page.get("name") or base.get("name"),
@@ -135,9 +244,9 @@ def merge_hotel_full(
         "image_count": album_total
         or page.get("image_count")
         or len(images),
-        "features": page.get("features") or [],
-        "facilities": page.get("facilities") or [],
-        "introduction": page.get("introduction"),
+        "features": features,
+        "facilities": page_fac or api_fac or base_fac,
+        "introduction": page.get("introduction") or api_intro or base.get("introduction"),
         "nearby": {
             "metro": pick_nearby("metro"),
             "airport": pick_nearby("airport"),

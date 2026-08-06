@@ -42,7 +42,7 @@ async function bootIndex() {
             ${h.score != null ? `<span class="score">${esc(h.score)}</span>` : ""}
             <div style="margin-top:8px">${esc(h.address || "地址待补全")}</div>
             <div style="margin-top:6px">房型 ${esc(h.room_count ?? 0)} 个</div>
-            ${h.min_price_hkd != null ? `<div style="margin-top:6px;font-weight:700;color:var(--accent,#ff5500)">HK$${esc(fmt(h.min_price_hkd))} 起${h.min_price_cny != null ? ` ≈¥${esc(fmt(h.min_price_cny))}` : ""}</div>` : ""}
+            <div style="margin-top:6px;font-weight:700;color:var(--accent,#ff5500)">${priceLabel(h)}</div>
           </div>
         </div>
       </a>`
@@ -70,7 +70,7 @@ function renderNearby(nearby) {
         .join("<br>")}</div>`
     );
   }
-  return blocks.join("") || "暂无";
+  return blocks.join("") || "待获取";
 }
 
 function roomCard(room, idx) {
@@ -86,12 +86,28 @@ function roomCard(room, idx) {
         ? `<span class="count">${imgs.length}</span>`
         : "";
 
-  const offers = (room.offers || [])
-    .map((o) => {
-      const left =
-        o.left != null ? `<div class="left">仅剩${esc(o.left)}间</div>` : "";
-      const price = priceHtml(o);
-      return `<div class="offer">
+  // Prefer international plans (HKD→CNY); fall back to domestic offers.
+  const plans = room.prices || [];
+  const offerRows = plans.length
+    ? plans.map((p) => {
+        const fold = p.folded ? `<span class="pill">折叠</span>` : "";
+        const left =
+          p.left != null ? `<div class="left">仅剩${esc(p.left)}间</div>` : "";
+        return `<div class="offer">
+        <div>
+          <span class="pill">${esc(p.meal || p.summary || "-")}</span>
+          <span class="pill ${/免费取消|可取消|免費取消/.test(p.cancel || "") ? "good" : ""}">${esc(p.cancel || "-")}</span>
+          <span class="pill">${esc(p.confirm || "")}</span>
+          ${fold}
+        </div>
+        <div>${p.occupancy != null ? `可住 ${esc(p.occupancy)} 人` : (p.summary ? esc(p.summary) : "-")}</div>
+        <div>${planPriceHtml(p)}${left}<button class="btn" type="button">查看政策</button></div>
+      </div>`;
+      })
+    : (room.offers || []).map((o) => {
+        const left =
+          o.left != null ? `<div class="left">仅剩${esc(o.left)}间</div>` : "";
+        return `<div class="offer">
         <div>
           <span class="pill">${esc(o.meal || "-")}</span>
           <span class="pill ${/免费取消|可取消/.test(o.cancel || "") ? "good" : ""}">${esc(o.cancel || "-")}</span>
@@ -99,23 +115,9 @@ function roomCard(room, idx) {
           <span class="pill">${esc(o.pay || "")}</span>
         </div>
         <div>${o.occupancy != null ? `可住 ${esc(o.occupancy)} 人` : "-"}</div>
-        <div>${price}${left}<button class="btn" type="button">查看政策</button></div>
+        <div>${planPriceHtml(o)}${left}<button class="btn" type="button">查看政策</button></div>
       </div>`;
-    })
-    .join("");
-
-  // International prices attached per physical room (plans under this room).
-  const pricePlans = (room.prices || [])
-    .map((p) => {
-      const p1 = p.price_hkd != null ? `HK$${esc(fmt(p.price_hkd))}` : "-";
-      const p2 = p.price_cny != null ? `<span class="dim">≈¥${esc(fmt(p.price_cny))}</span>` : "";
-      const fold = p.folded ? `<span class="pill">折叠</span>` : "";
-      return `<div class="offer">
-        <div><span class="pill">${esc(p.summary || p.room_name || "")}</span><span class="pill">${esc(p.meal || "")}</span>${fold}</div>
-        <div style="font-weight:700;color:var(--accent,#ff5500)">${p1} ${p2}</div>
-      </div>`;
-    })
-    .join("");
+      });
 
   return `<article class="room-block" data-idx="${idx}">
     <div class="room-media">
@@ -135,24 +137,29 @@ function roomCard(room, idx) {
         <span>${esc(room.wifi || "")}</span>
       </div>
       <button class="linkish" type="button" data-open="${idx}">房间详情</button>
-      ${pricePlans ? `<div class="price-plans"><div class="price-plans-title">价格（国际版）</div>${pricePlans}</div>` : ""}
-      <div class="offers">${offers || '<div class="meta" style="padding-top:10px">暂无售卖政策行</div>'}</div>
+      <div class="offers">${offerRows.join("") || '<div class="meta" style="padding-top:10px">待获取价格</div>'}</div>
     </div>
   </article>`;
 }
 
+function priceLabel(h) {
+  const minCny = h.min_price_cny;
+  const minHkd = h.min_price_hkd;
+  if (minCny != null) {
+    const hkd =
+      minHkd != null ? ` <span class="dim">(HK$${esc(fmt(minHkd))})</span>` : "";
+    return `¥${esc(fmt(minCny))} 起${hkd}`;
+  }
+  if (minHkd != null) return `HK$${esc(fmt(minHkd))} 起`;
+  return "待获取";
+}
+
 function priceInfoLine(h) {
   const pi = h.price_info;
-  const min = h.min_price_hkd;
-  if (!pi && min == null) return "";
-  const r = pi && pi.exchange_rate ? pi.exchange_rate : 0.9;
-  const minCny = h.min_price_cny != null ? h.min_price_cny : (min != null ? min * r : null);
-  let s = "";
-  if (min != null) {
-    s += ` · <span style="font-weight:700;color:var(--accent,#ff5500)">HK$${esc(fmt(min))} 起${minCny != null ? ` ≈¥${esc(fmt(minCny))}` : ""}</span>`;
-  }
+  const label = priceLabel(h);
+  let s = ` · <span style="font-weight:700;color:var(--accent,#ff5500)">${label}</span>`;
   if (pi && pi.exchange_rate) {
-    s += ` <span class="dim">(汇率 ${esc(pi.exchange_rate)})</span>`;
+    s += ` <span class="dim">(HKD→CNY ${esc(pi.exchange_rate)})</span>`;
   }
   return s;
 }
@@ -162,12 +169,18 @@ function fmt(n) {
   return Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
 }
 
-function priceHtml(o) {
-  const hkd = o.price_hkd != null ? `HK$${esc(fmt(o.price_hkd))}` : "";
-  const cny = o.price_cny != null ? `<span class="dim">≈¥${esc(fmt(o.price_cny))}</span>` : "";
-  return hkd || cny
-    ? `<span style="font-weight:700;color:var(--accent,#ff5500)">${hkd} ${cny}</span>`
-    : "";
+function planPriceHtml(p) {
+  const cny = p.price_cny != null ? p.price_cny : null;
+  const hkd = p.price_hkd != null ? p.price_hkd : null;
+  if (cny != null) {
+    const hkdBit =
+      hkd != null ? ` <span class="dim">HK$${esc(fmt(hkd))}</span>` : "";
+    return `<span style="font-weight:700;color:var(--accent,#ff5500)">¥${esc(fmt(cny))}${hkdBit}</span>`;
+  }
+  if (hkd != null) {
+    return `<span style="font-weight:700;color:var(--accent,#ff5500)">HK$${esc(fmt(hkd))}</span>`;
+  }
+  return `<span class="dim">待获取</span>`;
 }
 
 function openModal(room) {
@@ -224,7 +237,7 @@ async function bootHotel() {
   document.getElementById("score").textContent = h.score ?? "-";
   document.getElementById("scoreLabel").textContent = h.score_label || "";
   document.getElementById("review").textContent = h.review_count != null ? `共 ${h.review_count} 条点评` : "";
-  document.getElementById("intro").textContent = h.introduction || "暂无简介";
+  document.getElementById("intro").textContent = h.introduction || "待获取";
   document.getElementById("nearby").innerHTML = renderNearby(h.nearby);
 
   document.getElementById("features").innerHTML = (h.features || [])
@@ -232,7 +245,7 @@ async function bootHotel() {
     .join("");
   document.getElementById("facilities").innerHTML = (h.facilities || [])
     .map((f) => `<div class="fac-item">${esc(f.name || f)}${f.tag ? `<div class="tag-free">${esc(f.tag)}</div>` : ""}</div>`)
-    .join("") || '<div class="meta">暂无</div>';
+    .join("") || '<div class="meta">待获取</div>';
 
   const himgs = h.images || [];
   const hero = document.getElementById("hero");

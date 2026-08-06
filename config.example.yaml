@@ -37,9 +37,12 @@ output_dir: data
 # 国内版隐藏逐房型价格（priceStr='?'），国际版 hk.trip.com 未登录直接返回港币价格。
 # 开启后：基本信息仍走国内版，价格走国际版 getHotelRoomListOversea，港币按实时汇率折算人民币。
 # intl_price: true
-# intl_workers: 4                 # 国际版价格抓取并发线程数
-# intl_headed: false              # 国际版浏览器是否显示窗口
-# intl_proxy: null                # 国际版专用代理；默认复用 proxy
+# intl_workers: 4                 # 国际版 HTTP 并发（同时作为小批签发窗口）
+# intl_headed: true               # 签名浏览器建议有头；无头易被 WhaleGuard 430
+# intl_proxy: null                # 国际版专用代理；默认复用 proxy（需境外出口）
+# intl_http_retries: 2            # 失败后重签重试次数（不含首次）
+# intl_sign_batch: null           # 小批签发大小；null=跟 intl_workers
+# intl_rewarm_after: 2            # 连续 430 几次后自动重开签名会话
 
 # --- 代理（可选，规避 IP 风控） ---
 # proxy: http://ip:port            # 浏览器预热/房态抓取用的单个代理

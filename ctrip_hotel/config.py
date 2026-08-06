@@ -40,9 +40,12 @@ DEFAULTS: dict[str, Any] = {
     # International-site price fetch (hk.trip.com) — returns per-room prices in
     # HKD without login; prices are converted to CNY with a live rate.
     "intl_price": False,  # 是否抓国际版港币价格（默认关，开启后基本信息国内跑+价格国际版跑）
-    "intl_workers": 4,  # 国际版价格抓取并发线程数
-    "intl_headed": False,  # 国际版浏览器是否显示窗口
-    "intl_proxy": None,  # 国际版专用代理；默认用 proxy
+    "intl_workers": 4,  # 国际版 HTTP 并发（签名仍串行；同时作为小批签发窗口）
+    "intl_headed": True,  # 国际版签名浏览器建议有头；无头易被 WhaleGuard 430
+    "intl_proxy": None,  # 国际版专用代理；默认用 proxy（强烈建议境外代理）
+    "intl_http_retries": 2,  # 单家酒店失败后重签重试次数（不含首次）
+    "intl_sign_batch": None,  # 小批签发大小；null=跟 intl_workers，避免 token 等太久
+    "intl_rewarm_after": 2,  # 连续 session 级失败（430）几次后自动重预热
     # Optional proxies (e.g. http://ip:port). List fetch can rotate through
     # `proxy_list`; browser warmup uses `proxy`.
     "proxy": None,
