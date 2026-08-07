@@ -29,6 +29,16 @@ from typing import Any
 
 from curl_cffi import requests as cffi_requests
 
+from ctrip_hotel.http_session import session_post
+from ctrip_hotel.netutil import intl_proxy_ready, proxy_reachable, resolve_intl_proxy
+from ctrip_hotel.session_store import load_storage_state, save_storage_state
+from ctrip_hotel.warmup_gate import (
+    INTL_PLAYBOOK,
+    classify_intl_probe,
+    final_probe_error,
+    print_probe_diagnosis,
+)
+
 # ---------------------------------------------------------------------------
 # HKD -> CNY exchange rate
 # ---------------------------------------------------------------------------
@@ -120,19 +130,42 @@ class IntlRoomClient:
         self._route_installed = False
         self._last_rewarm_at = 0.0
         self._rewarm_cooldown_sec = 15.0
+        self._ready: bool = False
+        self._ready_detail: str = ""
+        self._session_channel = "intl_oversea"
 
     # -- lifecycle ---------------------------------------------------------
 
     def __enter__(self) -> "IntlRoomClient":
         from playwright.sync_api import sync_playwright
 
+        # Fail-fast: dead local proxy wastes minutes in headed Edge warmup loops.
+        # （正常路径：crawl 启动时已弹窗处理；这里兜底二次调用/脚本直调）
+        ok, msg = intl_proxy_ready(self.cfg, timeout=1.5)
+        if not ok:
+            raise RuntimeError(
+                f"intl proxy not ready: {msg}. "
+                "请先启动境外代理，或关闭 intl_price / 改正 intl_proxy。"
+            )
+        proxy = resolve_intl_proxy(self.cfg)
+        if proxy:
+            print(f"  [intl] proxy preflight ok: {msg}", flush=True)
+
+        t0 = time.time()
         self._pw = sync_playwright().start()
         headed = bool(self.cfg.get("intl_headed", True))
         launch_kwargs: dict[str, Any] = {
             "headless": not headed,
-            "args": ["--disable-dev-shm-usage"],
+            "args": [
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-background-networking",
+            ],
         }
-        channel = (self.cfg.get("browser_channel") or "").lower()
+        # Prefer dedicated intl channel; fall back to shared browser_channel.
+        channel = (
+            self.cfg.get("intl_browser_channel") or self.cfg.get("browser_channel") or ""
+        ).lower()
         try:
             if channel in {"msedge", "chrome"}:
                 self._browser = self._pw.chromium.launch(
@@ -145,7 +178,132 @@ class IntlRoomClient:
 
         self._new_context_and_page()
         self._warmup()
+        self._ensure_ready()
+        print(f"  [intl] client ready {time.time() - t0:.1f}s", flush=True)
         return self
+
+    def is_ready(self) -> bool:
+        return bool(self._ready and self._template_post)
+
+    def _ensure_ready(self) -> None:
+        """Hard gate: diagnose → auto-fix → only then allow batch."""
+        if not self._template_post:
+            raise final_probe_error(
+                channel="intl",
+                reason="template_missing",
+                detail="oversea template missing",
+                hotel_id=self.seed_hotel_id,
+                tried=[],
+            )
+
+        seeds = self._seed_ids()
+        seed_idx = 0
+        probe_id = seeds[seed_idx]
+        attempts = max(int(self.cfg.get("warmup_probe_retries") or 4), 1)
+        last_reason, last_detail = "empty", ""
+        tried: list[str] = []
+
+        for i in range(attempts):
+            payload = self.fetch_room(probe_id)
+            kind = _payload_kind(payload)
+            reason, detail = classify_intl_probe(payload, kind=kind)
+            if reason == "ok":
+                self._ready = True
+                self._ready_detail = detail
+                print(
+                    f"  [intl] probe ok ({i + 1}/{attempts}): hotel={probe_id} {detail}",
+                    flush=True,
+                )
+                if self._context is not None:
+                    save_storage_state(
+                        self._session_channel,
+                        self._context,
+                        extra={"probe_hotel": probe_id, "detail": detail},
+                    )
+                return
+
+            _, action, hint = INTL_PLAYBOOK.get(
+                reason, (reason, "backoff", "查看日志")
+            )
+            if action == "abort":
+                print_probe_diagnosis(
+                    channel="intl",
+                    reason=reason,
+                    detail=detail,
+                    action="不可自动修复，立即中止",
+                    hint=hint,
+                    attempt=i + 1,
+                    attempts=attempts,
+                    hotel_id=probe_id,
+                )
+                self._ready = False
+                raise final_probe_error(
+                    channel="intl",
+                    reason=reason,
+                    detail=detail,
+                    hotel_id=probe_id,
+                    tried=tried + [f"{reason}:abort"],
+                )
+
+            fix_desc = {
+                "rewarm": "刷新签名浏览器会话",
+                "resign_or_rewarm": "重签一次，仍失败则 rewarm",
+                "next_seed": f"换探针酒店 → {seeds[min(seed_idx + 1, len(seeds) - 1)]}",
+                "backoff": "短暂退避后重试",
+            }.get(action, action)
+            print_probe_diagnosis(
+                channel="intl",
+                reason=reason,
+                detail=detail,
+                action=f"执行 {action}: {fix_desc}",
+                hint=hint,
+                attempt=i + 1,
+                attempts=attempts,
+                hotel_id=probe_id,
+            )
+            last_reason, last_detail = reason, detail
+
+            if action == "next_seed" and seed_idx + 1 < len(seeds):
+                seed_idx += 1
+                probe_id = seeds[seed_idx]
+                self.seed_hotel_id = probe_id
+                tried.append(f"{reason}:next_seed:{probe_id}")
+                continue
+            if action in {"rewarm", "resign_or_rewarm", "session"} or reason in {
+                "session",
+                "signature",
+                "empty",
+            }:
+                # token(4030): fetch_room already resigned; escalate to rewarm.
+                need_rewarm = action in {"rewarm", "resign_or_rewarm"} or reason in {
+                    "session",
+                    "signature",
+                    "token",
+                    "empty",
+                }
+                if need_rewarm:
+                    tried.append(f"{reason}:rewarm")
+                    try:
+                        if seed_idx + 1 < len(seeds):
+                            seed_idx += 1
+                            self.seed_hotel_id = seeds[seed_idx]
+                            probe_id = seeds[seed_idx]
+                        self._rewarm(force=True)
+                    except Exception as e:
+                        print(f"  [intl] auto-fix rewarm failed: {e}", flush=True)
+                        last_detail = f"{detail}; rewarm={e}"
+                    continue
+            tried.append(f"{reason}:backoff")
+            time.sleep(0.45 * (i + 1))
+
+        self._ready = False
+        raise final_probe_error(
+            channel="intl",
+            reason=last_reason,
+            detail=last_detail,
+            hotel_id=probe_id,
+            tried=tried,
+        )
 
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
@@ -174,6 +332,10 @@ class IntlRoomClient:
         proxy = self._proxy_url()
         if proxy:
             context_kwargs["proxy"] = {"server": str(proxy)}
+        max_age = int(self.cfg.get("session_max_age_sec") or 6 * 3600)
+        state_path = load_storage_state(self._session_channel, max_age_sec=max_age)
+        if state_path is not None:
+            context_kwargs["storage_state"] = str(state_path)
         self._context = self._browser.new_context(**context_kwargs)
         self._page = self._context.new_page()
         self._page.add_init_script(
@@ -225,13 +387,23 @@ class IntlRoomClient:
     def _warmup(self) -> None:
         """Capture an unused Oversea request template; keep page for signing."""
         assert self._page is not None
+        t_warm = time.time()
         seed_ids = self._seed_ids()
         captured: dict[str, Any] = {}
 
         def handle_route(route) -> None:
             req = route.request
-            if "getHotelRoomListOversea" in req.url and "url" not in captured:
-                captured["url"] = req.url
+            url = req.url or ""
+            # Abort heavy assets — signer only needs JS + the oversea XHR template.
+            rtype = (req.resource_type or "").lower()
+            if rtype in {"image", "media", "font", "stylesheet", "texttrack"}:
+                try:
+                    route.abort()
+                except Exception:
+                    route.continue_()
+                return
+            if "getHotelRoomListOversea" in url and "url" not in captured:
+                captured["url"] = url
                 captured["post"] = req.post_data or ""
                 captured["headers"] = dict(req.headers)
                 route.abort()
@@ -240,12 +412,14 @@ class IntlRoomClient:
 
         if self._route_installed:
             try:
-                self._page.unroute("**/*getHotelRoomListOversea*")
+                self._page.unroute("**/*")
             except Exception:
                 pass
-        self._page.route("**/*getHotelRoomListOversea*", handle_route)
+        # Catch-all so we can abort images while still capturing the room XHR.
+        self._page.route("**/*", handle_route)
         self._route_installed = True
 
+        proxy_dead = False
         for i, sid in enumerate(seed_ids):
             url = (
                 f"https://hk.trip.com/hotels/detail/"
@@ -253,26 +427,62 @@ class IntlRoomClient:
                 f"&hotelId={sid}"
                 f"&checkIn={self.cfg['check_in']}&checkOut={self.cfg['check_out']}"
             )
-            print(f"  [intl] warmup attempt {i + 1}/{len(seed_ids)}: seed={sid}")
+            print(
+                f"  [intl] warmup attempt {i + 1}/{len(seed_ids)}: seed={sid}",
+                flush=True,
+            )
             captured.clear()
+            goto_err = ""
             try:
-                self._page.goto(url, timeout=60000)
+                self._page.goto(url, timeout=45000, wait_until="domcontentloaded")
             except Exception as e:
-                print(f"  [warmup] goto warning: {e}")
-            deadline = time.time() + 25
+                goto_err = str(e)
+                print(f"  [warmup] goto warning: {e}", flush=True)
+                # Dead proxy / tunnel errors will never recover by retrying seeds.
+                low = goto_err.lower()
+                if any(
+                    x in low
+                    for x in (
+                        "err_proxy_connection_failed",
+                        "err_tunnel_connection_failed",
+                        "err_proxy_connection_timed_out",
+                        "proxy connection",
+                    )
+                ):
+                    proxy_dead = True
+                    break
+            if proxy_dead:
+                break
+            # Shorter wait if navigation already failed (no XHR expected).
+            wait_sec = 5 if goto_err else 14
+            deadline = time.time() + wait_sec
             while time.time() < deadline:
                 if captured.get("post"):
                     break
-                self._page.wait_for_timeout(400)
+                # signature may appear before XHR; poll both
+                try:
+                    if self._page.evaluate(
+                        "() => typeof window.signature === 'function'"
+                    ):
+                        if captured.get("post"):
+                            break
+                except Exception:
+                    pass
+                self._page.wait_for_timeout(150)
                 if time.time() < deadline:
                     try:
-                        self._page.mouse.wheel(0, 1500)
+                        self._page.mouse.wheel(0, 1800)
                     except Exception:
                         pass
             if captured.get("post"):
                 break
 
         if not captured.get("post"):
+            if proxy_dead:
+                raise RuntimeError(
+                    "intl warmup failed: 代理连接失败（ERR_PROXY_*）。"
+                    "请确认 intl_proxy 指向可用的境外代理，或暂时关闭 intl_price。"
+                )
             raise RuntimeError(
                 "intl warmup failed: 未捕获到 getHotelRoomListOversea 请求模板。"
                 "常见原因：当前网络/IP 被国际站风控（whaleguard）。"
@@ -287,19 +497,23 @@ class IntlRoomClient:
         self._template_headers = captured["headers"] or {}
 
         ok = False
-        for _ in range(20):
+        for _ in range(16):
             ok = bool(
                 self._page.evaluate("() => typeof window.signature === 'function'")
             )
             if ok:
                 break
-            self._page.wait_for_timeout(200)
+            self._page.wait_for_timeout(120)
         if not ok:
             raise RuntimeError(
                 "intl warmup failed: 页面未暴露 window.signature，无法签发 phantom-token。"
             )
         self._session_fails = 0
-        print("  [intl] warmup ok: oversea template captured (signer ready)")
+        print(
+            f"  [intl] warmup ok: oversea template captured "
+            f"(signer ready) {time.time() - t_warm:.1f}s",
+            flush=True,
+        )
 
     def _rewarm(self, *, force: bool = False) -> bool:
         """Refresh signer session. Rate-limited to avoid WhaleGuard storms."""
@@ -359,6 +573,35 @@ class IntlRoomClient:
             raise RuntimeError(f"signature() returned invalid token: {token!r}")
         return token
 
+    def _sign_many(self, bodies: list[str]) -> list[str]:
+        """Sign many bodies in one page.evaluate (far fewer Playwright round-trips)."""
+        if not bodies:
+            return []
+        if len(bodies) == 1:
+            return [self._sign(bodies[0])]
+        assert self._page is not None
+        with self._lock:
+            try:
+                tokens = self._page.evaluate(
+                    """(arr) => {
+                        if (typeof window.signature !== 'function') {
+                            throw new Error('signature missing');
+                        }
+                        return arr.map((s) => window.signature(s));
+                    }""",
+                    bodies,
+                )
+            except Exception as e:
+                raise RuntimeError(f"signature() batch failed: {e}") from e
+        if not isinstance(tokens, list) or len(tokens) != len(bodies):
+            raise RuntimeError(f"signature() batch size mismatch: {tokens!r}")
+        out: list[str] = []
+        for token in tokens:
+            if not isinstance(token, str) or not token.startswith("100"):
+                raise RuntimeError(f"signature() returned invalid token: {token!r}")
+            out.append(token)
+        return out
+
     def _sign_safe(self, body_str: str) -> str:
         """Sign; on failure rewarm once (rate-limited) and retry."""
         try:
@@ -367,6 +610,13 @@ class IntlRoomClient:
             # Respect cooldown — force=True caused rewarm storms under 430.
             self._rewarm(force=False)
             return self._sign(body_str)
+
+    def _sign_many_safe(self, bodies: list[str]) -> list[str]:
+        try:
+            return self._sign_many(bodies)
+        except Exception:
+            self._rewarm(force=False)
+            return self._sign_many(bodies)
 
     def _cookies(self) -> str:
         assert self._context is not None
@@ -407,16 +657,15 @@ class IntlRoomClient:
 
     def _http_post(self, body_str: str, token: str, cookie: str | None = None) -> dict[str, Any]:
         try:
-            kwargs: dict[str, Any] = {
-                "data": body_str.encode("utf-8"),
-                "headers": self._headers(token, cookie=cookie),
-                "impersonate": "chrome",
-                "timeout": 30,
-            }
-            proxies = self._proxies()
-            if proxies:
-                kwargs["proxies"] = proxies
-            r = cffi_requests.post(self._template_url, **kwargs)
+            r = session_post(
+                self._template_url,
+                data=body_str.encode("utf-8"),
+                headers=self._headers(token, cookie=cookie),
+                proxies=self._proxies(),
+                impersonate="chrome",
+                timeout=30,
+                tag="intl_room",
+            )
             text = r.text or ""
             if not text.startswith("{"):
                 return {
@@ -458,18 +707,24 @@ class IntlRoomClient:
         *,
         workers: int,
     ) -> dict[int | str, dict[str, Any]]:
-        """Sign a small wave then HTTP-fetch in parallel (fresh cookies)."""
+        """Sign a small wave (batched) then HTTP-fetch in parallel (fresh cookies)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        signed: list[tuple[int | str, str, str]] = []
+        bodies: list[tuple[int | str, str]] = []
         out: dict[int | str, dict[str, Any]] = {}
         for hid in hotel_ids:
-            body_str = self._body_for_hotel(hid)
-            try:
-                token = self._sign_safe(body_str)
-                signed.append((hid, body_str, token))
-            except Exception as e:
+            bodies.append((hid, self._body_for_hotel(hid)))
+
+        try:
+            tokens = self._sign_many_safe([b for _, b in bodies])
+        except Exception as e:
+            for hid, _ in bodies:
                 out[hid] = {"error": str(e), "data": {}}
+            return out
+
+        signed: list[tuple[int | str, str, str]] = []
+        for (hid, body_str), token in zip(bodies, tokens):
+            signed.append((hid, body_str, token))
 
         if not signed:
             return out
@@ -496,25 +751,34 @@ class IntlRoomClient:
         """Chunked sign→HTTP: short-lived tokens, limited rewarm, one retry wave."""
         if not hotel_ids:
             return []
+        if not self.is_ready():
+            raise RuntimeError(
+                "拒绝国际价批量抓取：预热探针未通过 "
+                f"(ready={self._ready}, detail={self._ready_detail!r})"
+            )
         if not self._template_post:
             return [{"error": "client not warmed up", "data": {}} for _ in hotel_ids]
 
         workers = max(int(max_workers), 1)
         chunk_size = self._sign_batch_size(workers)
         results: dict[int | str, dict[str, Any]] = {}
+        n_chunks = (len(hotel_ids) + chunk_size - 1) // chunk_size
 
         for i in range(0, len(hotel_ids), chunk_size):
+            chunk_idx = i // chunk_size
             chunk = list(hotel_ids[i : i + chunk_size])
             wave = self._sign_http_wave(chunk, workers=workers)
 
             retry_ids: list[int | str] = []
             session_hits = 0
+            ok_hits = 0
             for hid in chunk:
                 payload = wave.get(hid) or {"error": "missing", "data": {}}
                 kind = _payload_kind(payload)
                 if kind == "ok":
                     results[hid] = payload
                     self._session_fails = 0
+                    ok_hits += 1
                 else:
                     if kind == "session":
                         session_hits += 1
@@ -529,7 +793,7 @@ class IntlRoomClient:
                         print(f"  [intl] rewarm failed: {e}", flush=True)
                     time.sleep(0.8)
                 else:
-                    time.sleep(0.2)
+                    time.sleep(0.15)
                 wave2 = self._sign_http_wave(retry_ids, workers=workers)
                 for hid in retry_ids:
                     payload = wave2.get(hid) or wave.get(hid) or {
@@ -539,12 +803,19 @@ class IntlRoomClient:
                     results[hid] = payload
                     if _payload_kind(payload) == "ok":
                         self._session_fails = 0
+                        ok_hits += 1
             else:
                 for hid in retry_ids:
                     results[hid] = wave.get(hid) or {"error": "failed", "data": {}}
 
-            # Pace chunks — bulk 430 often means we were too hot.
-            time.sleep(1.0)
+            # Pace chunks only when needed — skip after last; shorten on healthy waves.
+            if chunk_idx + 1 < n_chunks:
+                if session_hits >= max(len(chunk) // 2, 1):
+                    time.sleep(0.8)
+                elif ok_hits == len(chunk):
+                    time.sleep(0.12)
+                else:
+                    time.sleep(0.35)
 
         return [
             results.get(hid) or {"error": "missing result", "data": {}}

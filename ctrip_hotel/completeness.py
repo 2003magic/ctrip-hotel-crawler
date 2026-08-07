@@ -41,7 +41,13 @@ def room_gaps(rooms: list[dict[str, Any]]) -> list[str]:
         return ["rooms"]
     gaps = []
     no_img = sum(1 for r in rooms if not r.get("images"))
-    no_cat = sum(1 for r in rooms if not r.get("detail_categories"))
+    # detail_categories may be synthesized; also accept basic attrs as "has detail"
+    no_cat = sum(
+        1
+        for r in rooms
+        if not r.get("detail_categories")
+        and not (r.get("bed") or r.get("area") or r.get("window"))
+    )
     if no_img:
         gaps.append(f"rooms_without_images:{no_img}")
     if no_cat:

@@ -58,19 +58,50 @@ def normalize_hotels_from_dom(cards: list[dict[str, Any]]) -> list[dict[str, Any
     return rows
 
 
+def _is_image_url(url: str) -> bool:
+    u = url.lower()
+    if not u.startswith("http"):
+        return False
+    if any(x in u for x in (".mp4", "video-preview", "/videos/", "viewall", "placeholder", "np-pic.png")):
+        return False
+    return True
+
+
 def _img_urls(picture_info: Any) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
-    if not isinstance(picture_info, list):
-        return urls
-    for p in picture_info:
-        if not isinstance(p, dict):
-            continue
-        u = p.get("url") or p.get("bigPicUrl") or p.get("smallPicUrl")
+
+    def add(u: Any) -> None:
         if not u or not isinstance(u, str):
+            return
+        if not _is_image_url(u) or "查看" in u:
+            return
+        if u in seen:
+            return
+        seen.add(u)
+        urls.append(u)
+
+    if isinstance(picture_info, list):
+        for p in picture_info:
+            if isinstance(p, dict):
+                add(p.get("url") or p.get("bigPicUrl") or p.get("smallPicUrl") or p.get("imageUrl"))
+            elif isinstance(p, str):
+                add(p)
+    return urls
+
+
+def _browse_img_urls(proom: dict[str, Any]) -> list[str]:
+    """High-res room gallery from roomPhotoBrowseModel.imageItemList (2026 API)."""
+    model = proom.get("roomPhotoBrowseModel") or {}
+    if not isinstance(model, dict):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for it in model.get("imageItemList") or []:
+        if not isinstance(it, dict):
             continue
-        # skip non-image / placeholder
-        if "viewall" in u.lower() or "查看" in u:
+        u = it.get("originalImageUrl") or it.get("imageUrl")
+        if not u or not isinstance(u, str) or not _is_image_url(u):
             continue
         if u in seen:
             continue
@@ -107,7 +138,7 @@ def _facility_item(sub: dict[str, Any]) -> dict[str, Any]:
 
 
 def _room_from_physic(proom: dict[str, Any]) -> dict[str, Any]:
-    fac = proom.get("faciltityInfo") or {}
+    fac = proom.get("faciltityInfo") or proom.get("facilityInfo") or {}
     categories = []
     for block in fac.get("list") or []:
         if not isinstance(block, dict):
@@ -126,15 +157,44 @@ def _room_from_physic(proom: dict[str, Any]) -> dict[str, Any]:
     area = (proom.get("areaInfo") or {}).get("title")
     floor = (proom.get("floorInfo") or {}).get("title")
     wifi = (proom.get("wifiInfo") or {}).get("title")
+    live = (proom.get("liveInfo") or {}).get("title")
     brief = []
     for f in proom.get("physicalFacilityList") or []:
         if isinstance(f, dict) and f.get("title"):
             brief.append({"icon": f.get("icon"), "title": f.get("title")})
 
+    # 2026 inland API often omits faciltityInfo; synthesize overview from attrs.
+    if not categories:
+        overview = []
+        for title, val in (
+            ("床型", bed),
+            ("窗户", window),
+            ("面积", area),
+            ("楼层", floor),
+            ("吸烟", smoke),
+            ("网络", wifi),
+            ("入住", live),
+        ):
+            if val:
+                overview.append({"name": title, "free": None, "note": str(val), "available": True})
+        if not overview and proom.get("name"):
+            overview.append(
+                {
+                    "name": "房型",
+                    "free": None,
+                    "note": str(proom.get("name")),
+                    "available": True,
+                }
+            )
+        if overview:
+            categories.append({"title": "房型概况", "items": overview})
+
+    images = _browse_img_urls(proom) or _img_urls(proom.get("pictureInfo"))
+
     return {
         "room_id": proom.get("id"),
         "room_name": proom.get("name"),
-        "images": _img_urls(proom.get("pictureInfo")),
+        "images": images,
         "bed": bed,
         "window": window,
         "smoke": smoke,
@@ -272,26 +332,45 @@ def merge_hotel_info(
 
 
 def fill_hotel_images_from_rooms(doc: dict[str, Any]) -> dict[str, Any]:
-    """If hotel gallery empty, assemble covers from room photos (deduped)."""
+    """If hotel gallery thin/empty, assemble covers from room photos (deduped)."""
     hotel = doc.get("hotel") or {}
-    if hotel.get("images"):
+    existing = list(hotel.get("images") or [])
+    # Upgrade when album only left a video cover / single thumb.
+    if len(existing) >= 8:
         return doc
-    seen: set[str] = set()
-    imgs: list[str] = []
+    seen: set[str] = set(existing)
+    imgs: list[str] = list(existing)
     for room in doc.get("rooms") or []:
         for u in room.get("images") or []:
             if u in seen:
                 continue
             seen.add(u)
             imgs.append(u)
-            if len(imgs) >= 12:
+            if len(imgs) >= 24:
                 break
-        if len(imgs) >= 12:
+        if len(imgs) >= 24:
             break
-    hotel["images"] = imgs
-    hotel["image_count"] = hotel.get("image_count") or len(imgs)
-    doc["hotel"] = hotel
+    if imgs:
+        hotel["images"] = imgs
+        hotel["image_count"] = max(int(hotel.get("image_count") or 0), len(imgs))
+        doc["hotel"] = hotel
     return doc
+
+
+def _min_price_from_api(api_payload: dict[str, Any] | None) -> float | None:
+    if not api_payload:
+        return None
+    data = api_payload.get("data") or api_payload
+    if not isinstance(data, dict):
+        return None
+    bar = data.get("hotelDetailBarInfo") or {}
+    raw = bar.get("price")
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(str(raw).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def build_hotel_document(
@@ -343,6 +422,10 @@ def build_hotel_document(
         if isinstance(fetch_result, dict)
         else None,
     )
+    min_price = _min_price_from_api(api)
+    if min_price is not None:
+        hotel["min_price"] = min_price
+        hotel["min_price_currency"] = "CNY"
     doc = {
         "hotel_id": hotel.get("hotel_id") or hotel_meta.get("hotel_id"),
         "check_in": check_in,

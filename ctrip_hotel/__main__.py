@@ -8,6 +8,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+# Windows pipes (Tee-Object) otherwise fully buffer crawl progress for minutes.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 from ctrip_hotel.client import CtripHotelClient
 from ctrip_hotel.config import EXAMPLE_CONFIG_PATH, ROOT, load_config
 from ctrip_hotel.crawl_engine import (
@@ -52,6 +59,8 @@ def _latest_run(output_dir: Path) -> Path | None:
 
 
 def cmd_crawl(args: argparse.Namespace) -> int:
+    from ctrip_hotel.netutil import confirm_intl_without_proxy, intl_proxy_ready
+
     cfg = load_config(Path(args.config) if args.config else None)
     if args.headed is not None:
         cfg["headed"] = args.headed
@@ -68,6 +77,18 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         cfg["mode"] = args.mode
     if args.intl_price is not None:
         cfg["intl_price"] = args.intl_price
+
+    # 开了国际价但代理没找到/连不上：弹窗，别空跑
+    if cfg.get("intl_price"):
+        ok, detail = intl_proxy_ready(cfg)
+        if not ok:
+            print(f"[intl] 代理未就绪: {detail}", flush=True)
+            action = confirm_intl_without_proxy(detail)
+            if action == "abort":
+                print("已取消抓取。请启动代理后重试，或加 --no-intl-price。")
+                return 2
+            cfg["intl_price"] = False
+            print("[intl] 已关闭国际价，仅抓国内数据。", flush=True)
 
     run_dir = new_run_dir(cfg["output_dir"])
     write_json(run_dir / "config.used.json", cfg)

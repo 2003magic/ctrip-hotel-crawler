@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -13,6 +14,7 @@ from ctrip_hotel.api_client import (
     normalize_list_payloads,
 )
 from ctrip_hotel.intl_client import (
+    EXCHANGE_FALLBACK,
     IntlRoomClient,
     fetch_hkd_cny_rate,
     merge_prices_into_doc,
@@ -39,6 +41,9 @@ from ctrip_hotel.store import write_json, write_jsonl
 def fetch_hotel_catalog(cfg: dict[str, Any], run_dir: Path) -> list[dict[str, Any]]:
     if cfg.get("mode") == "api":
         proxies = extract_proxy_pool(cfg)
+        # Avoid fetching full `pages` when max_hotels is smaller (big wall-time win).
+        max_hotels = cfg.get("max_hotels")
+        max_items = int(max_hotels) + 5 if max_hotels else None
         items = fetch_hotel_list_pure(
             city_id=cfg["city_id"],
             check_in=cfg["check_in"],
@@ -47,6 +52,7 @@ def fetch_hotel_catalog(cfg: dict[str, Any], run_dir: Path) -> list[dict[str, An
             page_size=int(cfg.get("page_size") or 20),
             delay_ms=int(cfg.get("delay_ms") or 0),
             proxies=proxies,
+            max_items=max_items,
         )
         hotels = normalize_list_payloads(items)
         if hotels:
@@ -203,6 +209,101 @@ def _worker_crawl(
     }
 
 
+def _fetch_intl_payloads(
+    hotels: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    run_dir: Path,
+) -> tuple[list[dict[str, Any]], float]:
+    """Warm intl signer + fetch all oversea payloads. Safe to run beside domestic."""
+    t0 = time.time()
+    worker_dir = run_dir / "workers" / "intl"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    intl_ids = [h["hotel_id"] for h in hotels]
+    seed = intl_ids[0] if intl_ids else cfg.get("seed_hotel_id")
+
+    # FX rate fetch overlaps with headed Edge warmup (independent network path).
+    rate_box: dict[str, float] = {}
+
+    def _rate() -> None:
+        rate_box["rate"] = fetch_hkd_cny_rate()
+
+    rate_thread = threading.Thread(target=_rate, name="fx-rate", daemon=True)
+    rate_thread.start()
+
+    with IntlRoomClient(cfg, worker_id=0, seed_hotel_id=seed) as intl:
+        if not intl.is_ready():
+            raise RuntimeError(
+                f"intl warmup gate: client not ready ({intl._ready_detail!r})"
+            )
+        t_http = time.time()
+        payloads = intl.fetch_room_batch(
+            intl_ids, max_workers=max(int(cfg.get("intl_workers") or 4), 1)
+        )
+        print(f"[intl] batch HTTP {time.time() - t_http:.1f}s", flush=True)
+    rate_thread.join(timeout=3)
+    rate = float(rate_box.get("rate") or EXCHANGE_FALLBACK)
+    for h, payload in zip(hotels, payloads):
+        save_raw_payloads(worker_dir, f"intl_room_{h['hotel_id']}", [payload])
+    print(
+        f"[intl] HTTP 完成 {len(hotels)} 家 耗时 {time.time() - t0:.1f}s (汇率 {rate:.4f})",
+        flush=True,
+    )
+    return payloads, rate
+
+
+def _apply_intl_payloads(
+    docs: list[dict[str, Any]],
+    hotels: list[dict[str, Any]],
+    payloads: list[dict[str, Any]],
+    rate: float,
+    cfg: dict[str, Any],
+    run_dir: Path,
+) -> list[dict[str, Any]]:
+    hotels_dir = run_dir / "hotels"
+    doc_index = {d.get("hotel_id"): i for i, d in enumerate(docs)}
+    merged = 0
+    for h, payload in zip(hotels, payloads):
+        hid = h["hotel_id"]
+        if not payload or payload.get("error"):
+            continue
+        price_info = normalize_intl_prices(
+            payload,
+            check_in=cfg["check_in"],
+            check_out=cfg["check_out"],
+            rate=rate,
+        )
+        if not price_info.get("rooms"):
+            continue
+        idx = doc_index.get(hid)
+        if idx is None:
+            continue
+        merged_doc = merge_prices_into_doc(docs[idx], price_info)
+        docs[idx] = merged_doc
+        write_json(hotels_dir / f"{hid}.json", merged_doc)
+        merged += 1
+    print(f"[intl] 价格合并 {merged}/{len(hotels)} 家", flush=True)
+    return docs
+
+
+def _merge_intl_prices(
+    docs: list[dict[str, Any]],
+    hotels: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    run_dir: Path,
+) -> list[dict[str, Any]]:
+    """One shared IntlRoomClient for the whole run (avoids N headed Edge warmups)."""
+    if not cfg.get("intl_price") or not hotels:
+        return docs
+    t0 = time.time()
+    try:
+        payloads, rate = _fetch_intl_payloads(hotels, cfg, run_dir)
+        docs = _apply_intl_payloads(docs, hotels, payloads, rate, cfg, run_dir)
+        print(f"[intl] 总耗时 {time.time() - t0:.1f}s", flush=True)
+    except Exception as e:
+        print(f"[intl] 价格抓取失败: {e}", flush=True)
+    return docs
+
+
 def _worker_crawl_api(
     worker_id: int,
     hotels: list[dict[str, Any]],
@@ -215,9 +316,8 @@ def _worker_crawl_api(
     (and optionally album/additional templates). After warmup, room status for all
     hotels is fetched with curl_cffi in a thread pool — no browser per hotel.
 
-    album / additional are best-effort: if the page captured templates for them,
-    they are replayed in-page serially; otherwise they are omitted (list meta still
-    provides name/star/score/address and a cover image).
+    album / additional prefer pure HTTP (parallel); fall back to in-page replay.
+    International price merge runs once after all API workers (see crawl_rooms_parallel).
     """
     run = Path(run_dir)
     worker_dir = run / "workers" / f"w{worker_id}"
@@ -228,21 +328,45 @@ def _worker_crawl_api(
     docs: list[dict[str, Any]] = []
     ok_ids: list[Any] = []
     err_ids: list[Any] = []
-    delay = int(cfg.get("delay_ms") or 0) / 1000.0
     max_workers = max(int(cfg.get("api_workers") or 8), 1)
+    hotel_ids = [h["hotel_id"] for h in hotels]
 
     print(f"[w{worker_id}] API 模式开始，本组 {len(hotels)} 家 (并发 {max_workers})")
-    with ApiRoomClient(cfg, worker_id=worker_id) as client:
-        room_payloads = client.fetch_room_batch(
-            [h["hotel_id"] for h in hotels], max_workers=max_workers
+    t_warm = time.time()
+    # __enter__ 内：捕获模板 → 真实 HTTP 探针验活 → 失败则抛错，绝不开跑批量。
+    try:
+        client_ctx = ApiRoomClient(cfg, worker_id=worker_id)
+    except Exception as e:
+        print(f"[w{worker_id}] 预热客户端创建失败，已中止: {e}", flush=True)
+        raise
+
+    with client_ctx as client:
+        if not client.is_ready():
+            raise RuntimeError(
+                f"API warmup gate: client not ready ({client._ready_detail!r})"
+            )
+        print(
+            f"[w{worker_id}] warmup+probe {time.time() - t_warm:.1f}s "
+            f"({client._ready_detail})",
+            flush=True,
+        )
+        t_rooms = time.time()
+        room_payloads = client.fetch_room_batch(hotel_ids, max_workers=max_workers)
+        print(
+            f"[w{worker_id}] rooms HTTP {len(hotels)} 家 {time.time() - t_rooms:.1f}s",
+            flush=True,
+        )
+        t_enrich = time.time()
+        enrich = client.fetch_enrich_batch(hotel_ids, max_workers=max_workers)
+        print(
+            f"[w{worker_id}] album/additional {len(hotels)} 家 {time.time() - t_enrich:.1f}s",
+            flush=True,
         )
         for h, room_payload in zip(hotels, room_payloads):
             hid = h["hotel_id"]
             name = h.get("name") or ""
+            album_payload, additional_payload = enrich.get(hid, ({}, {}))
             try:
-                # Best-effort album/additional via in-page replay (optional).
-                album_payload = client.fetch_album(hid)
-                additional_payload = client.fetch_additional(hid)
                 result = build_fetch_result(
                     hotel_id=hid,
                     hotel_meta=h,
@@ -324,47 +448,7 @@ def _worker_crawl_api(
             except Exception as e:
                 err_ids.append(hid)
                 print(f"[w{worker_id}]   !! {hid} {e}")
-            if delay > 0:
-                time.sleep(delay)
-
-    # --- 国际版价格抓取（可选）：补国内版，合并进同一酒店 JSON ---
-    if cfg.get("intl_price"):
-        try:
-            rate = fetch_hkd_cny_rate()
-            intl_ids = [h["hotel_id"] for h in hotels]
-            # 必须用本组真实酒店 ID 预热；config 里的 seed=1 在国际站往往打不开房态
-            seed = intl_ids[0] if intl_ids else cfg.get("seed_hotel_id")
-            with IntlRoomClient(
-                cfg, worker_id=worker_id, seed_hotel_id=seed
-            ) as intl:
-                intl_payloads = intl.fetch_room_batch(
-                    intl_ids, max_workers=max(int(cfg.get("intl_workers") or 4), 1)
-                )
-            doc_index = {d.get("hotel_id"): i for i, d in enumerate(docs)}
-            merged = 0
-            for h, payload in zip(hotels, intl_payloads):
-                hid = h["hotel_id"]
-                save_raw_payloads(worker_dir, f"intl_room_{hid}", [payload])
-                if not payload or payload.get("error"):
-                    continue
-                price_info = normalize_intl_prices(
-                    payload,
-                    check_in=cfg["check_in"],
-                    check_out=cfg["check_out"],
-                    rate=rate,
-                )
-                if not price_info.get("rooms"):
-                    continue
-                idx = doc_index.get(hid)
-                if idx is None:
-                    continue
-                merged_doc = merge_prices_into_doc(docs[idx], price_info)
-                docs[idx] = merged_doc
-                write_json(hotels_dir / f"{hid}.json", merged_doc)
-                merged += 1
-            print(f"[w{worker_id}] intl 价格合并 {merged}/{len(hotels)} 家 (汇率 {rate:.4f})")
-        except Exception as e:
-            print(f"[w{worker_id}] intl 价格抓取失败: {e}")
+            # API 批量已完成，此处不再按 delay_ms 空等（那是浏览器串行模式用的）
 
     write_json(
         worker_dir / "summary.json",
@@ -385,7 +469,13 @@ def crawl_rooms_parallel(
     cfg: dict[str, Any],
     run_dir: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    workers = max(int(cfg.get("workers") or 1), 1)
+    t_all = time.time()
+    # API 模式：房态是纯 HTTP 并发，浏览器只用于一次 token 预热。
+    # 多 worker 只会重复开浏览器，不提速还浪费（尤其 intl headed Edge）。
+    if cfg.get("mode") == "api":
+        workers = 1
+    else:
+        workers = max(int(cfg.get("workers") or 1), 1)
     groups = split_groups(hotels, workers)
     jobs = [(i, g) for i, g in enumerate(groups) if g]
     write_json(
@@ -409,11 +499,41 @@ def crawl_rooms_parallel(
     crawled_hotels: list[dict[str, Any]] = []
 
     worker_fn = _worker_crawl_api if cfg.get("mode") == "api" else _worker_crawl
+    parallel_intl = (
+        cfg.get("mode") == "api"
+        and cfg.get("intl_price")
+        and bool(hotels)
+    )
 
-    if len(jobs) == 1:
+    intl_payloads: list[dict[str, Any]] | None = None
+    intl_rate = 0.0
+    intl_error: Exception | None = None
+
+    if parallel_intl:
+        # 实测：与国内 warmup 同时启动总墙钟更短；错开启动会把 intl 整段延后。
+        print("[crawl] 国内 + 国际价并行…", flush=True)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            domestic_fut = ex.submit(worker_fn, jobs[0][0], jobs[0][1], cfg, str(run_dir))
+            intl_fut = ex.submit(_fetch_intl_payloads, hotels, cfg, run_dir)
+            res = domestic_fut.result()
+            all_docs.extend(res["docs"])
+            crawled_hotels.extend(res["hotels"])
+            try:
+                intl_payloads, intl_rate = intl_fut.result()
+            except Exception as e:
+                intl_error = e
+        if intl_error:
+            print(f"[intl] 价格抓取失败: {intl_error}", flush=True)
+        elif intl_payloads is not None:
+            all_docs = _apply_intl_payloads(
+                all_docs, crawled_hotels, intl_payloads, intl_rate, cfg, run_dir
+            )
+    elif len(jobs) == 1:
         res = worker_fn(jobs[0][0], jobs[0][1], cfg, str(run_dir))
         all_docs.extend(res["docs"])
         crawled_hotels.extend(res["hotels"])
+        if cfg.get("mode") == "api" and cfg.get("intl_price"):
+            all_docs = _merge_intl_prices(all_docs, crawled_hotels, cfg, run_dir)
     else:
         with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
             futs = {
@@ -424,6 +544,8 @@ def crawl_rooms_parallel(
                 res = fut.result()
                 all_docs.extend(res["docs"])
                 crawled_hotels.extend(res["hotels"])
+        if cfg.get("mode") == "api" and cfg.get("intl_price"):
+            all_docs = _merge_intl_prices(all_docs, crawled_hotels, cfg, run_dir)
 
     # catalog for preview
     catalog = []
@@ -445,4 +567,5 @@ def crawl_rooms_parallel(
         )
     write_json(run_dir / "catalog.json", catalog)
     write_jsonl(run_dir / "catalog.jsonl", catalog)
+    print(f"[crawl] 总耗时 {time.time() - t_all:.1f}s", flush=True)
     return crawled_hotels, all_docs

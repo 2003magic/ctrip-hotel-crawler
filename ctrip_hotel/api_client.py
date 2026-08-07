@@ -29,6 +29,14 @@ from typing import Any
 from curl_cffi import requests as cffi_requests
 
 from ctrip_hotel.config import ROOT
+from ctrip_hotel.http_session import session_post
+from ctrip_hotel.session_store import load_storage_state, save_storage_state
+from ctrip_hotel.warmup_gate import (
+    DOMESTIC_PLAYBOOK,
+    classify_domestic_probe,
+    final_probe_error,
+    print_probe_diagnosis,
+)
 
 # ---------------------------------------------------------------------------
 # Hotel list — pure HTTP (no browser needed)
@@ -36,6 +44,12 @@ from ctrip_hotel.config import ROOT
 
 _LIST_URL = "https://m.ctrip.com/restapi/soa2/31454/fetchHotelList"
 _ROOM_URL = "https://m.ctrip.com/restapi/soa2/33278/getHotelRoomListInland"
+
+
+def _domestic_room_ok(payload: dict[str, Any] | None, *, token: str = "") -> tuple[bool, str]:
+    """Return (ok, detail) for a getHotelRoomListInland payload."""
+    reason, detail = classify_domestic_probe(payload, token=token)
+    return reason == "ok", detail
 
 
 def extract_proxy_pool(cfg: dict[str, Any]) -> list[str]:
@@ -102,11 +116,13 @@ def fetch_hotel_list_pure(
     on_page: Any = None,
     proxy: str | None = None,
     proxies: list[str] | None = None,
+    max_items: int | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch hotel catalog via pure HTTP (curl_cffi impersonate=chrome).
 
     `proxy` is a single proxy URL like "http://ip:port".
     `proxies` is a list of proxy URLs; requests rotate through them per page.
+    `max_items`: stop paging once enough raw list items are collected.
     """
     headers = {
         "User-Agent": MOBILE_UA,
@@ -120,6 +136,8 @@ def fetch_hotel_list_pure(
     if proxy:
         proxy_pool.append(proxy)
     all_items: list[dict[str, Any]] = []
+    t_list = time.time()
+    need = int(max_items) if max_items else 0
     for page_idx in range(1, int(pages or 1) + 1):
         body = {
             "head": _LIST_HEAD,
@@ -130,10 +148,18 @@ def fetch_hotel_list_pure(
         }
         proxy_url = proxy_pool[(page_idx - 1) % len(proxy_pool)] if proxy_pool else None
         try:
-            kwargs: dict[str, Any] = {"impersonate": "chrome", "timeout": 20}
-            if proxy_url:
-                kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-            r = cffi_requests.post(_LIST_URL, json=body, headers=headers, **kwargs)
+            proxies = (
+                {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            )
+            r = session_post(
+                _LIST_URL,
+                json=body,
+                headers=headers,
+                proxies=proxies,
+                impersonate="chrome",
+                timeout=20,
+                tag="api_list",
+            )
             j = r.json()
         except Exception as e:
             print(f"  [list] page {page_idx} error: {e}")
@@ -145,11 +171,18 @@ def fetch_hotel_list_pure(
         all_items.extend(items)
         if on_page:
             on_page(items, page_idx)
+        if need and len(all_items) >= need:
+            break
         if page_idx < int(pages or 1) and delay_ms:
             time.sleep(delay_ms / 1000.0)
         # Ctrip caps pageSize ~20; stop if fewer than requested (last page).
         if len(items) < int(page_size):
             break
+    print(
+        f"  [list] {len(all_items)} items / {page_idx} page(s) "
+        f"{time.time() - t_list:.1f}s",
+        flush=True,
+    )
     return all_items
 
 
@@ -202,11 +235,15 @@ class ApiRoomClient:
         self.seed_hotel_id = seed_hotel_id
         self._pw = None
         self._browser = None
+        self._context = None
         self._page = None
         self._template: dict[str, Any] | None = None
         self._album_template: dict[str, Any] | None = None
         self._additional_template: dict[str, Any] | None = None
         self._cookies: str = ""
+        self._ready: bool = False
+        self._ready_detail: str = ""
+        self._session_channel = "api_domestic"
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -219,9 +256,22 @@ class ApiRoomClient:
         headed = bool(self.cfg.get("api_headed", self.cfg.get("headed", False)))
         launch_kwargs: dict[str, Any] = {
             "headless": not headed,
-            "args": ["--disable-dev-shm-usage"],
+            "args": [
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-background-networking",
+            ],
         }
-        channel = (self.cfg.get("browser_channel") or "").lower()
+        # Prefer bundled Chromium for domestic API so it does not fight headed
+        # Edge used by intl signer (intl_browser_channel / browser_channel).
+        channel = (
+            self.cfg.get("api_browser_channel")
+            if "api_browser_channel" in self.cfg
+            else ""
+        )
+        if channel is None:
+            channel = ""
+        channel = str(channel).lower()
         if channel in {"msedge", "chrome"}:
             try:
                 self._browser = self._pw.chromium.launch(
@@ -242,7 +292,13 @@ class ApiRoomClient:
         proxy = self.cfg.get("proxy") or self.cfg.get("browser_proxy")
         if proxy:
             context_kwargs["proxy"] = {"server": str(proxy)}
+        # Reuse cookies/localStorage from last successful run (Playwright storage_state).
+        max_age = int(self.cfg.get("session_max_age_sec") or 6 * 3600)
+        state_path = load_storage_state(self._session_channel, max_age_sec=max_age)
+        if state_path is not None:
+            context_kwargs["storage_state"] = str(state_path)
         ctx = self._browser.new_context(**context_kwargs)
+        self._context = ctx
         self._page = ctx.new_page()
         self._page.add_init_script(
             """
@@ -250,20 +306,155 @@ class ApiRoomClient:
             window.chrome = window.chrome || { runtime: {} };
             """
         )
+        # Capture template, then LIVE probe — batch must not start until probe passes.
         self._warmup()
+        self._ensure_ready()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def is_ready(self) -> bool:
+        return bool(self._ready and self._template)
+
+    def _probe_seed_ids(self) -> list[Any]:
+        seeds: list[Any] = []
+        if self.seed_hotel_id is not None:
+            seeds.append(self.seed_hotel_id)
+        cfg_seed = self.cfg.get("seed_hotel_id")
+        if cfg_seed:
+            seeds.append(cfg_seed)
+        for x in self.cfg.get("seed_hotel_ids") or []:
+            if str(x).isdigit():
+                seeds.append(int(x))
         try:
-            if self._browser:
-                self._browser.close()
+            body = json.loads((self._template or {}).get("post") or "{}")
+            hid = (body.get("search") or {}).get("hotelId")
+            if hid:
+                seeds.insert(0, hid)
         except Exception:
             pass
-        try:
-            if self._pw:
-                self._pw.stop()
-        except Exception:
-            pass
+        # dedupe preserve order
+        out: list[Any] = []
+        seen: set[str] = set()
+        for s in seeds:
+            k = str(s)
+            if k not in seen:
+                seen.add(k)
+                out.append(s)
+        return out or [1]
+
+    def _ensure_ready(self) -> None:
+        """Hard gate: diagnose → auto-fix → only then allow batch."""
+        if not self._template:
+            raise final_probe_error(
+                channel="api",
+                reason="template_missing",
+                detail="room template missing",
+                hotel_id=self.seed_hotel_id,
+                tried=[],
+            )
+
+        seeds = self._probe_seed_ids()
+        seed_idx = 0
+        probe_id = seeds[seed_idx]
+        attempts = max(int(self.cfg.get("warmup_probe_retries") or 4), 1)
+        last_reason, last_detail = "empty", ""
+        tried: list[str] = []
+
+        for i in range(attempts):
+            token = (self._template.get("headers") or {}).get("phantom-token") or ""
+            if not str(token).strip():
+                reason, detail = "empty_token", "phantom-token empty"
+                _, action, hint = DOMESTIC_PLAYBOOK[reason]
+                print_probe_diagnosis(
+                    channel="api",
+                    reason=reason,
+                    detail=detail,
+                    action=f"执行 {action}: 重新捕获页面模板",
+                    hint=hint,
+                    attempt=i + 1,
+                    attempts=attempts,
+                    hotel_id=probe_id,
+                )
+                tried.append(f"{reason}:recapture")
+                last_reason, last_detail = reason, detail
+                if self._page is None:
+                    break
+                try:
+                    self.seed_hotel_id = seeds[min(seed_idx, len(seeds) - 1)]
+                    self._warmup()
+                except Exception as e:
+                    last_detail = f"{detail}; recapture={e}"
+                continue
+
+            payload = self.fetch_room(probe_id)
+            reason, detail = classify_domestic_probe(payload, token=token)
+            if reason == "ok":
+                self._ready = True
+                self._ready_detail = detail
+                print(
+                    f"  [api] probe ok ({i + 1}/{attempts}): hotel={probe_id} {detail}",
+                    flush=True,
+                )
+                # Persist browser state for next run (hybrid: browser once tax amortized).
+                if self._context is not None:
+                    save_storage_state(
+                        self._session_channel,
+                        self._context,
+                        extra={"probe_hotel": probe_id, "detail": detail},
+                    )
+                if self._album_template and self._additional_template:
+                    self.release_browser()
+                return
+
+            _, action, hint = DOMESTIC_PLAYBOOK.get(
+                reason, (reason, "backoff", "查看日志")
+            )
+            fix_desc = {
+                "recapture": "重新预热捕获 token",
+                "next_seed": f"换探针酒店 → {seeds[min(seed_idx + 1, len(seeds) - 1)]}",
+                "backoff": "短暂退避后重试",
+            }.get(action, action)
+            print_probe_diagnosis(
+                channel="api",
+                reason=reason,
+                detail=detail,
+                action=f"执行 {action}: {fix_desc}",
+                hint=hint,
+                attempt=i + 1,
+                attempts=attempts,
+                hotel_id=probe_id,
+            )
+            last_reason, last_detail = reason, detail
+
+            if action == "next_seed" and seed_idx + 1 < len(seeds):
+                seed_idx += 1
+                probe_id = seeds[seed_idx]
+                tried.append(f"{reason}:next_seed:{probe_id}")
+                continue
+            if action == "recapture":
+                tried.append(f"{reason}:recapture")
+                if self._page is None:
+                    break
+                try:
+                    if seed_idx + 1 < len(seeds):
+                        seed_idx += 1
+                        self.seed_hotel_id = seeds[seed_idx]
+                        probe_id = seeds[seed_idx]
+                    self._warmup()
+                except Exception as e:
+                    last_detail = f"{detail}; recapture={e}"
+                continue
+            # backoff
+            tried.append(f"{reason}:backoff")
+            time.sleep(0.5 * (i + 1))
+
+        self._ready = False
+        raise final_probe_error(
+            channel="api",
+            reason=last_reason,
+            detail=last_detail,
+            hotel_id=probe_id,
+            tried=tried,
+        )
 
     # -- warmup ------------------------------------------------------------
 
@@ -338,6 +529,23 @@ class ApiRoomClient:
 
         self._page.on("request", _on_request)
 
+        def _block_heavy(route) -> None:
+            try:
+                rtype = (route.request.resource_type or "").lower()
+                if rtype in {"image", "media", "font", "stylesheet", "texttrack"}:
+                    route.abort()
+                else:
+                    route.continue_()
+            except Exception:
+                # Route may already be settled when page closes mid-warmup.
+                pass
+
+        try:
+            self._page.route("**/*", _block_heavy)
+        except Exception:
+            pass
+
+        t_warm = time.time()
         for i, sid in enumerate(seed_ids):
             url = (
                 f"https://m.ctrip.com/webapp/hotel/hoteldetail/{sid}.html"
@@ -350,11 +558,11 @@ class ApiRoomClient:
             except Exception:
                 pass
             try:
-                self._page.goto(url, timeout=60000)
+                self._page.goto(url, timeout=45000, wait_until="domcontentloaded")
             except Exception as e:
                 print(f"  [warmup] goto warning: {e}")
             # Wait for room API; keep scrolling so album/additional lazy-load too.
-            deadline = time.time() + 28
+            deadline = time.time() + 16
             while time.time() < deadline:
                 try:
                     cap = self._page.evaluate("() => window.__CTRIP_CAPTURED__ || {}")
@@ -367,17 +575,18 @@ class ApiRoomClient:
                 if cap.get("additional"):
                     captured["additional"] = cap["additional"]
                 if captured.get("room") and captured.get("additional"):
+                    # album is optional — room browse images usually cover gaps
                     break
-                self._page.wait_for_timeout(400)
+                self._page.wait_for_timeout(200)
                 if time.time() < deadline:
                     try:
-                        self._page.mouse.wheel(0, 1600)
+                        self._page.mouse.wheel(0, 1800)
                     except Exception:
                         pass
             if "room" in captured:
                 # Extra scroll window for additional if still missing.
                 if "additional" not in captured:
-                    extra_deadline = time.time() + 12
+                    extra_deadline = time.time() + 6
                     while time.time() < extra_deadline and "additional" not in captured:
                         try:
                             cap = self._page.evaluate(
@@ -389,12 +598,13 @@ class ApiRoomClient:
                             captured["additional"] = cap["additional"]
                         if cap.get("album"):
                             captured["album"] = cap["album"]
-                        self._page.wait_for_timeout(400)
+                        self._page.wait_for_timeout(200)
                         try:
                             self._page.mouse.wheel(0, 1800)
                         except Exception:
                             pass
                 break
+        print(f"  [api] capture phase {time.time() - t_warm:.1f}s", flush=True)
 
         if "room" not in captured:
             raise RuntimeError(
@@ -418,12 +628,43 @@ class ApiRoomClient:
         except Exception:
             self._cookies = ""
         print(
-            f"  [api] warmup ok: room={'Y' if self._template else 'N'} "
+            f"  [api] warmup capture ok: room={'Y' if self._template else 'N'} "
             f"album={'Y' if self._album_template else 'N'} "
             f"additional={'Y' if self._additional_template else 'N'}"
         )
+        # Browser is released only after _ensure_ready() probe passes.
 
-    # -- room fetch (pure HTTP, token reuse) --------------------------------
+    def release_browser(self) -> None:
+        """Close Playwright; keep captured templates/cookies for HTTP reuse."""
+        # Unroute first — closing with active route handlers spams CancelledError.
+        try:
+            if self._page is not None:
+                self._page.unroute("**/*")
+        except Exception:
+            pass
+        try:
+            if self._browser:
+                self._browser.close()
+        except Exception:
+            pass
+        self._browser = None
+        self._context = None
+        self._page = None
+        try:
+            if self._pw:
+                self._pw.stop()
+        except Exception:
+            pass
+        self._pw = None
+        ev = self.cfg.get("_api_browser_released")
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release_browser()
 
     def _room_headers(self) -> dict[str, str]:
         """Build headers for pure-HTTP room requests from the captured template."""
@@ -456,19 +697,21 @@ class ApiRoomClient:
 
     def fetch_room(self, hotel_id: int | str) -> dict[str, Any]:
         """Fetch full room status for one hotel via pure HTTP (token reuse)."""
-        assert self._template is not None, "client not warmed up"
+        if self._template is None:
+            raise RuntimeError("client not warmed up: room template missing")
         try:
             body = json.loads(self._template["post"])
             body["search"]["hotelId"] = int(hotel_id)
         except Exception:
             body = {"search": {"hotelId": int(hotel_id)}}
         try:
-            r = cffi_requests.post(
+            r = session_post(
                 self._template["url"],
                 json=body,
                 headers=self._room_headers(),
                 impersonate="chrome",
                 timeout=20,
+                tag="api_room",
             )
             j = r.json()
         except Exception as e:
@@ -484,6 +727,11 @@ class ApiRoomClient:
         max_workers: int = 8,
     ) -> list[dict[str, Any]]:
         """Fetch rooms for many hotels with a thread pool (pure HTTP)."""
+        if not self.is_ready():
+            raise RuntimeError(
+                "拒绝批量抓取：API 预热探针未通过 "
+                f"(ready={self._ready}, detail={self._ready_detail!r})"
+            )
         if max_workers <= 1:
             out = []
             for hid in hotel_ids:
@@ -508,28 +756,8 @@ class ApiRoomClient:
 
     # -- album / additional -------------------------------------------------
 
-    def fetch_album(self, hotel_id: int | str) -> dict[str, Any]:
-        """Fetch hotel gallery album via in-page fetch replay."""
-        assert self._page is not None
-        if not self._album_template:
-            return {}
-        return self._replay("album", self._album_template, hotel_id)
-
-    def fetch_additional(self, hotel_id: int | str) -> dict[str, Any]:
-        """Fetch hotel POI / nearby / tips via in-page fetch replay."""
-        assert self._page is not None
-        if not self._additional_template:
-            return {}
-        return self._replay("additional", self._additional_template, hotel_id)
-
-    def _replay(
-        self,
-        kind: str,
-        template: dict[str, Any],
-        hotel_id: int | str,
-    ) -> dict[str, Any]:
-        """Replay a captured request inside the page, changing only hotelId."""
-        post = template["post"]
+    def _enrich_body(self, kind: str, template: dict[str, Any], hotel_id: int | str) -> str:
+        post = template.get("post") or ""
         try:
             body = json.loads(post)
             if kind == "album":
@@ -540,9 +768,128 @@ class ApiRoomClient:
             elif kind == "additional":
                 if body.get("queryInfo") is not None:
                     body["queryInfo"]["hotelId"] = int(hotel_id)
-            payload = json.dumps(body)
+            return json.dumps(body)
         except Exception:
-            payload = post
+            return post
+
+    def _fetch_enrich_http(
+        self, kind: str, template: dict[str, Any], hotel_id: int | str
+    ) -> dict[str, Any]:
+        """Pure-HTTP album/additional using room session phantom-token + cookies."""
+        url = template.get("url") or ""
+        if not url:
+            return {}
+        payload = self._enrich_body(kind, template, hotel_id)
+        try:
+            r = session_post(
+                url,
+                data=payload.encode("utf-8") if isinstance(payload, str) else payload,
+                headers=self._room_headers(),
+                impersonate="chrome",
+                timeout=20,
+                tag="api_enrich",
+            )
+            j = r.json()
+        except Exception as e:
+            return {"error": str(e)}
+        return j if isinstance(j, dict) else {}
+
+    def fetch_album(self, hotel_id: int | str) -> dict[str, Any]:
+        """Fetch hotel gallery; prefer HTTP, fall back to in-page replay."""
+        if not self._album_template:
+            return {}
+        http = self._fetch_enrich_http("album", self._album_template, hotel_id)
+        if http and not http.get("error") and (
+            http.get("data") or http.get("AlbumCategoryList") or http.get("ResponseStatus")
+        ):
+            return http
+        if self._page is None:
+            return http or {}
+        return self._replay("album", self._album_template, hotel_id)
+
+    def fetch_additional(self, hotel_id: int | str) -> dict[str, Any]:
+        """Fetch POI/nearby; prefer HTTP, fall back to in-page replay."""
+        if not self._additional_template:
+            return {}
+        http = self._fetch_enrich_http("additional", self._additional_template, hotel_id)
+        if http and not http.get("error") and (
+            http.get("data") or http.get("ResponseStatus")
+        ):
+            return http
+        if self._page is None:
+            return http or {}
+        return self._replay("additional", self._additional_template, hotel_id)
+
+    def fetch_enrich_batch(
+        self,
+        hotel_ids: list[int | str],
+        *,
+        max_workers: int = 8,
+    ) -> dict[Any, tuple[dict[str, Any], dict[str, Any]]]:
+        """Parallel album+additional via HTTP (stable fallback to serial page replay)."""
+        out: dict[Any, tuple[dict[str, Any], dict[str, Any]]] = {
+            hid: ({}, {}) for hid in hotel_ids
+        }
+        if not self._album_template and not self._additional_template:
+            return out
+
+        def _http_ok_album(p: dict[str, Any]) -> bool:
+            return bool(p) and not p.get("error") and bool(
+                p.get("data") or p.get("AlbumCategoryList")
+            )
+
+        def _http_ok_add(p: dict[str, Any]) -> bool:
+            return bool(p) and not p.get("error") and bool(
+                p.get("data") or p.get("ResponseStatus")
+            )
+
+        def _one(hid: int | str) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+            album: dict[str, Any] = {}
+            add: dict[str, Any] = {}
+            if self._album_template:
+                album = self._fetch_enrich_http("album", self._album_template, hid)
+            if self._additional_template:
+                add = self._fetch_enrich_http(
+                    "additional", self._additional_template, hid
+                )
+            return hid, album, add
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        workers = max(min(max_workers, len(hotel_ids) or 1), 1)
+        http_results: dict[Any, tuple[dict[str, Any], dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_one, hid) for hid in hotel_ids]
+            for fut in as_completed(futs):
+                hid, album, add = fut.result()
+                http_results[hid] = (album, add)
+
+        # Serial page fallback for HTTP misses (Playwright page is not thread-safe).
+        fallback_n = 0
+        for hid in hotel_ids:
+            album, add = http_results.get(hid, ({}, {}))
+            if self._album_template and not _http_ok_album(album) and self._page:
+                album = self._replay("album", self._album_template, hid)
+                fallback_n += 1
+            if self._additional_template and not _http_ok_add(add) and self._page:
+                add = self._replay("additional", self._additional_template, hid)
+                fallback_n += 1
+            out[hid] = (
+                album if isinstance(album, dict) else {},
+                add if isinstance(add, dict) else {},
+            )
+        if fallback_n:
+            print(f"  [api] enrich page-fallback calls={fallback_n}", flush=True)
+        return out
+
+    def _replay(
+        self,
+        kind: str,
+        template: dict[str, Any],
+        hotel_id: int | str,
+    ) -> dict[str, Any]:
+        """Replay a captured request inside the page, changing only hotelId."""
+        payload = self._enrich_body(kind, template, hotel_id)
         try:
             j = self._page.evaluate(
                 """async (args) => {
@@ -600,13 +947,37 @@ def images_from_album_picture(album_payload: dict[str, Any]) -> list[str]:
     """Extract image URLs from the `getHotelAlbumPicture` response.
 
     Structure: data.AlbumCategoryList[].PictureCategoryList[].AlbumPictureList[]
-    Each picture has SmallUrl / LargeUrl / OtherUrl.
+    Each picture has LargeUrl / SmallUrl / OtherUrl / VideoImageUrl.
+    2026+: many official slots are video-only (use VideoImageUrl cover);
+    user photos often return empty URL fields (anti-scrape) — callers should
+    fall back to room browse images / introduction pictures.
     """
     if not album_payload:
         return []
     data = album_payload.get("data") or album_payload
     urls: list[str] = []
     seen: set[str] = set()
+
+    def _ok(u: Any) -> bool:
+        if not u or not isinstance(u, str):
+            return False
+        low = u.lower().strip()
+        if not low.startswith("http"):
+            return False
+        if any(x in low for x in (".mp4", "video-preview", "/videos/")):
+            # allow only if it looks like a cover jpg hosted under videos path
+            if not any(low.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                return False
+        if "placeholder" in low or "np-pic.png" in low:
+            return False
+        return True
+
+    def add(u: Any) -> None:
+        if not _ok(u) or u in seen:
+            return
+        seen.add(u)
+        urls.append(u)
+
     for cat in data.get("AlbumCategoryList") or []:
         if not isinstance(cat, dict):
             continue
@@ -616,15 +987,13 @@ def images_from_album_picture(album_payload: dict[str, Any]) -> list[str]:
             for pic in pcat.get("AlbumPictureList") or []:
                 if not isinstance(pic, dict):
                     continue
-                u = (
+                add(
                     pic.get("LargeUrl")
                     or pic.get("OtherUrl")
                     or pic.get("SmallUrl")
                     or pic.get("NewSmallUrl")
+                    or pic.get("VideoImageUrl")
                 )
-                if u and isinstance(u, str) and u not in seen:
-                    seen.add(u)
-                    urls.append(u)
                 if len(urls) >= 60:
                     break
             if len(urls) >= 60:

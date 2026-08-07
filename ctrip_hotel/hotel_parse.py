@@ -140,13 +140,56 @@ def introduction_from_additional(additional: dict[str, Any] | None) -> str | Non
         for c in comments[:5]:
             if isinstance(c, str) and c.strip():
                 bits.append(c.strip().strip("“”\""))
+            elif isinstance(c, dict):
+                t = (c.get("content") or c.get("comment") or c.get("title") or "").strip()
+                if t:
+                    bits.append(t.strip("“”\""))
         for t in tips[:3]:
             if isinstance(t, dict) and t.get("title"):
                 bits.append(str(t["title"]))
+        # Policy blurbs as last resort
+        if not bits:
+            policy = data.get("hotelPolicy") or {}
+            for item in (policy.get("policyItems") or [])[:3]:
+                if not isinstance(item, dict):
+                    continue
+                title = (item.get("title") or item.get("policyTitle") or "").strip()
+                desc = (item.get("desc") or item.get("content") or "").strip()
+                if title and desc:
+                    bits.append(f"{title}：{desc[:80]}")
+                elif desc:
+                    bits.append(desc[:120])
+                elif title:
+                    bits.append(title)
         text = "；".join(bits).strip()
     if len(text) < 8:
         return None
     return text[:800]
+
+
+def images_from_introduction(additional: dict[str, Any] | None) -> list[str]:
+    """Pull pictureList from hotelIntroduction.sectionList (album URLs often stripped)."""
+    if not additional:
+        return []
+    data = additional.get("data") or additional
+    intro = data.get("hotelIntroduction") or {}
+    if not isinstance(intro, dict):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for sec in intro.get("sectionList") or []:
+        if not isinstance(sec, dict):
+            continue
+        for u in sec.get("pictureList") or []:
+            if not isinstance(u, str) or not u.startswith("http"):
+                continue
+            if u in seen:
+                continue
+            seen.add(u)
+            urls.append(u)
+            if len(urls) >= 24:
+                return urls
+    return urls
 
 
 def facilities_from_additional(additional: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -221,6 +264,14 @@ def merge_hotel_full(
         return a or b
 
     images = album_imgs or list(page.get("images") or [])
+    if len(images) < 4:
+        intro_imgs = images_from_introduction(additional)
+        if intro_imgs:
+            seen = set(images)
+            for u in intro_imgs:
+                if u not in seen:
+                    seen.add(u)
+                    images.append(u)
     api_intro = introduction_from_additional(additional)
     api_fac = facilities_from_additional(additional)
     page_fac = page.get("facilities") or []
